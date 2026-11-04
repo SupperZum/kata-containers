@@ -42,9 +42,13 @@ mod confidential_data_hub;
 mod config;
 mod console;
 mod device;
+#[cfg(feature = "exec-observer")]
+mod exec_observer;
 mod features;
 mod guest_extension_image;
 mod initdata;
+#[cfg(feature = "launch-admission")]
+mod launch_admission;
 mod linux_abi;
 mod metrics;
 mod mount;
@@ -367,6 +371,12 @@ async fn start_sandbox(
     tasks: &mut Vec<JoinHandle<Result<()>>>,
     shutdown: Receiver<bool>,
 ) -> Result<()> {
+    config.validate_exec_proof_config()?;
+    #[cfg(feature = "exec-observer")]
+    anyhow::ensure!(
+        !config.debug_console,
+        "exec observer does not support debug console"
+    );
     let debug_console_vport = config.debug_console_vport as u32;
 
     if config.debug_console {
@@ -395,11 +405,39 @@ async fn start_sandbox(
     }
 
     let sandbox = Arc::new(Mutex::new(s));
+    #[cfg(feature = "exec-observer")]
+    capctl::prctl::set_subreaper(true).context("initialize subreaper before RPC admission")?;
+    #[cfg(feature = "exec-observer")]
+    let (exec_observer, observer_owner) = exec_observer::Observer::start(64)?;
+    #[cfg(feature = "exec-observer")]
+    let _observer_shutdown =
+        scopeguard::guard(exec_observer.clone(), |observer| observer.shutdown());
+    #[cfg(feature = "exec-observer")]
+    let (observer_done_tx, observer_done_rx) = tokio::sync::oneshot::channel();
+    #[cfg(feature = "exec-observer")]
+    tasks.push(tokio::task::spawn_blocking(move || {
+        let result = observer_owner
+            .join()
+            .map_err(|_| anyhow!("exec observer owner panicked"))
+            .and_then(|result| result);
+        let completion = result
+            .as_ref()
+            .map(|_| ())
+            .map_err(|error| error.to_string());
+        let _ = observer_done_tx.send(completion);
+        result
+    }));
+    #[cfg(feature = "exec-observer")]
+    let exec_tasks = Arc::new(std::sync::Mutex::new(rpc::ExecTasks::default()));
 
     let signal_handler_task = tokio::spawn(setup_signal_handler(
         logger.clone(),
         sandbox.clone(),
         shutdown.clone(),
+        #[cfg(feature = "exec-observer")]
+        exec_observer.clone(),
+        #[cfg(feature = "exec-observer")]
+        exec_tasks.clone(),
     ));
 
     tasks.push(signal_handler_task);
@@ -453,13 +491,35 @@ async fn start_sandbox(
     }
 
     // vsock:///dev/vsock, port
-    let mut server =
-        rpc::start(sandbox.clone(), config.server_addr.as_str(), init_mode, oma).await?;
+    let mut server = rpc::start(
+        sandbox.clone(),
+        config.server_addr.as_str(),
+        init_mode,
+        oma,
+        #[cfg(feature = "exec-observer")]
+        exec_observer.clone(),
+        #[cfg(feature = "exec-observer")]
+        exec_tasks,
+    )
+    .await?;
 
     server.start().await?;
 
     rx.await?;
     server.shutdown().await?;
+    #[cfg(feature = "exec-observer")]
+    {
+        // Keep the sole kernel wait consumer alive until the ptrace owner has drained terminal events.
+        exec_observer.shutdown();
+        observer_done_rx
+            .await
+            .context("join exec observer owner")?
+            .map_err(|error| anyhow!(error))?;
+        anyhow::ensure!(
+            exec_observer.active_tasks()? == 0,
+            "observer tasks remain after shutdown"
+        );
+    }
 
     Ok(())
 }

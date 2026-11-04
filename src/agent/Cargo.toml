@@ -82,6 +82,7 @@ safe-path.workspace = true
 logging.workspace = true
 vsock-exporter.workspace = true
 pathrs.workspace = true
+execution-proof-handoff = { path = "../../../execution-proof-prototype/handoff", optional = true }
 
 # Initdata
 base64 = { workspace = true }
@@ -104,6 +105,8 @@ test-utils.workspace = true
 lto = true
 
 [features]
+launch-admission = ["dep:execution-proof-handoff"]
+exec-observer = []
 seccomp = ["rustjail/seccomp"]
 agent-policy = ["kata-agent-policy"]
 init-data = []

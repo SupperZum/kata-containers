@@ -19,6 +19,10 @@ import "google/protobuf/empty.proto";
 
 // unstable
 service AgentService {
+	// Verify software admission prerequisites only. Content preparation and all
+	// proof-required workload launch paths remain unavailable.
+	rpc GetPreparationAdmissionChallenge(google.protobuf.Empty) returns (PreparationAdmissionChallenge);
+	rpc ValidatePreparationAdmission(ValidatePreparationAdmissionRequest) returns (google.protobuf.Empty);
 	// execution
 	rpc CreateContainer(CreateContainerRequest) returns (google.protobuf.Empty);
 	rpc StartContainer(StartContainerRequest) returns (google.protobuf.Empty);
@@ -79,6 +83,18 @@ service AgentService {
 	rpc GetVolumeStats(VolumeStatsRequest) returns (VolumeStatsResponse);
 	rpc ResizeVolume(ResizeVolumeRequest) returns (google.protobuf.Empty);
 	rpc SetPolicy(SetPolicyRequest) returns (google.protobuf.Empty);
+}
+
+message PreparationAdmissionChallenge {
+	string guest_nonce = 1;
+}
+
+message ValidatePreparationAdmissionRequest {
+	// Untrusted transport bytes. The guest owns every trust root, expectation,
+	// boot/attempt context, nonce and clock used to verify these statements.
+	bytes signed_grant_json = 1;
+	bytes signed_policy_aggregate_json = 2;
+	bytes signed_authority_admission_json = 3;
 }
 
 message CreateContainerRequest {
