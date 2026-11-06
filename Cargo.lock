@@ -2145,7 +2145,10 @@ name = "execution-proof-handoff"
 version = "0.1.0"
 dependencies = [
  "execution-proof-contract",
+ "libc",
  "ring",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -3580,6 +3583,7 @@ dependencies = [
  "derivative",
  "execution-proof-handoff",
  "futures",
+ "image-rs-preparation",
  "ipnetwork",
  "kata-agent-policy",
  "kata-sys-util",
@@ -10004,4 +10008,16 @@ dependencies = [
  "serde",
  "syn 2.0.117",
  "winnow 1.0.2",
+]
+
+[[package]]
+name = "image-rs-preparation"
+version = "0.1.0"
+dependencies = [
+ "nix 0.31.3",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "thiserror 2.0.18",
+ "zeroize",
 ]

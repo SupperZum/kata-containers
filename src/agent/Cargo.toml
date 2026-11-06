@@ -83,6 +83,7 @@ logging.workspace = true
 vsock-exporter.workspace = true
 pathrs.workspace = true
 execution-proof-handoff = { path = "../../../execution-proof-prototype/handoff", optional = true }
+image-rs = { package = "image-rs-preparation", path = "../../../guest-components-prepared-dev/image-rs/preparation-core", default-features = false, features = ["launch-preparation-receive"], optional = true }
 
 # Initdata
 base64 = { workspace = true }
@@ -106,6 +107,7 @@ lto = true
 
 [features]
 launch-admission = ["dep:execution-proof-handoff"]
+rootfs-custody = ["launch-admission", "execution-proof-handoff/rootfs-custody", "dep:image-rs"]
 exec-observer = ["rustjail/exec-observer"]
 seccomp = ["rustjail/seccomp"]
 agent-policy = ["kata-agent-policy"]

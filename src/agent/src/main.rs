@@ -49,6 +49,8 @@ mod guest_extension_image;
 mod initdata;
 #[cfg(feature = "launch-admission")]
 mod launch_admission;
+#[cfg(feature = "rootfs-custody")]
+pub mod rootfs_custody;
 mod linux_abi;
 mod metrics;
 mod mount;
