@@ -106,7 +106,7 @@ lto = true
 
 [features]
 launch-admission = ["dep:execution-proof-handoff"]
-exec-observer = []
+exec-observer = ["rustjail/exec-observer"]
 seccomp = ["rustjail/seccomp"]
 agent-policy = ["kata-agent-policy"]
 init-data = []

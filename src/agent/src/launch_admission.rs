@@ -42,11 +42,10 @@ impl AdmissionRuntime {
                 let code = match error {
                     GuestAdmissionError::Unsupported(_) => ttrpc::Code::UNIMPLEMENTED,
                     GuestAdmissionError::TooLarge => ttrpc::Code::RESOURCE_EXHAUSTED,
-                    GuestAdmissionError::Conflict => ttrpc::Code::FAILED_PRECONDITION,
-                    GuestAdmissionError::ClockUnavailable
-                    | GuestAdmissionError::ClockOutOfRange
-                    | GuestAdmissionError::ClockRegression
-                    | GuestAdmissionError::Poisoned
+                    GuestAdmissionError::Conflict
+                    | GuestAdmissionError::NotReady
+                    | GuestAdmissionError::AlreadyConsumed => ttrpc::Code::FAILED_PRECONDITION,
+                    GuestAdmissionError::Poisoned
                     | GuestAdmissionError::EntropyUnavailable
                     | GuestAdmissionError::InvalidConfiguration => ttrpc::Code::UNAVAILABLE,
                     GuestAdmissionError::Contract(_) | GuestAdmissionError::BindingMismatch => {

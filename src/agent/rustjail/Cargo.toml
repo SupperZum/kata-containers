@@ -60,4 +60,5 @@ tempfile.workspace = true
 test-utils.workspace = true
 
 [features]
+exec-observer = []
 seccomp = ["libseccomp"]

@@ -654,7 +654,7 @@ impl AgentService {
                     "observer arm no longer valid"
                 );
             }
-            ctr.exec().await?;
+            ctr.exec_observed(OBSERVER_TIMEOUT).await?;
         }
         let identity = attempt.wait_observed(OBSERVER_TIMEOUT).await?;
         info!(sl(), "observed init task kernel exec"; "generation" => identity.generation, "pid" => identity.pid);
