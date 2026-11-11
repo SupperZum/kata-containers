@@ -323,6 +323,8 @@ pub(crate) type SharedExecTasks = Arc<std::sync::Mutex<ExecTasks>>;
 pub struct AgentService {
     sandbox: Arc<Mutex<Sandbox>>,
     init_mode: bool,
+    #[cfg(feature = "final-task")]
+    final_tasks: Option<crate::final_task_runtime::FinalTaskRuntime>,
     oma: Option<mem_agent::agent::MemAgent>,
     #[cfg(feature = "launch-admission")]
     preparation_admission: crate::launch_admission::AdmissionRuntime,
@@ -342,6 +344,26 @@ impl std::fmt::Debug for AgentService {
 }
 
 impl AgentService {
+    #[cfg(feature = "final-task")]
+    fn final_runtime(&self) -> ttrpc::Result<&crate::final_task_runtime::FinalTaskRuntime> {
+        self.final_tasks.as_ref().ok_or_else(|| {
+            ttrpc_error(
+                ttrpc::Code::UNIMPLEMENTED,
+                "execution proof required: trusted final task runtime unavailable",
+            )
+        })
+    }
+
+    #[cfg(feature = "final-task")]
+    fn final_observer(&self) -> ttrpc::Result<&Observer> {
+        self.exec_observer.as_ref().ok_or_else(|| {
+            ttrpc_error(
+                ttrpc::Code::UNIMPLEMENTED,
+                "final task observer unavailable",
+            )
+        })
+    }
+
     #[cfg_attr(feature = "exec-observer", instrument(skip(self, req)))]
     #[cfg_attr(not(feature = "exec-observer"), instrument)]
     async fn do_create_container(
@@ -1209,6 +1231,41 @@ impl agent_ttrpc::AgentService for AgentService {
         ctx: &TtrpcContext,
         req: protocols::agent::CreateContainerRequest,
     ) -> ttrpc::Result<Empty> {
+        #[cfg(feature = "final-task")]
+        if AGENT_CONFIG.exec_proof_required {
+            is_allowed(&req).await?;
+            let runtime = self.final_runtime()?;
+            if !req.devices.is_empty()
+                || !req.storages.is_empty()
+                || !req.shared_mounts.is_empty()
+                || req.sandbox_pidns
+                || req.string_user.is_some()
+                || req.stdin_port != 0
+                || req.stdout_port != 0
+                || req.stderr_port != 0
+                || (!req.exec_id.is_empty() && req.exec_id != req.container_id)
+            {
+                return Err(ttrpc_error(
+                    ttrpc::Code::INVALID_ARGUMENT,
+                    "unsupported final task device/storage/namespace/user/IO transform",
+                ));
+            }
+            let spec: oci_spec::runtime::Spec = req
+                .OCI
+                .into_option()
+                .ok_or_else(|| {
+                    ttrpc_error(ttrpc::Code::INVALID_ARGUMENT, "missing final task spec")
+                })?
+                .into();
+            let process = spec.process().as_ref().ok_or_else(|| {
+                ttrpc_error(ttrpc::Code::INVALID_ARGUMENT, "missing final task process")
+            })?;
+            runtime
+                .create(&req.container_id, &spec, process, self.final_observer()?)
+                .map_ttrpc_err(same)?;
+            return Ok(Empty::new());
+        }
+
         ensure_workload_launch_available(&AGENT_CONFIG)?;
         #[cfg(not(feature = "exec-observer"))]
         trace_rpc_call!(ctx, "create_container", req);
@@ -1226,6 +1283,16 @@ impl agent_ttrpc::AgentService for AgentService {
         ctx: &TtrpcContext,
         req: protocols::agent::StartContainerRequest,
     ) -> ttrpc::Result<Empty> {
+        #[cfg(feature = "final-task")]
+        if AGENT_CONFIG.exec_proof_required {
+            is_allowed(&req).await?;
+            self.final_runtime()?
+                .start(&req.container_id, self.final_observer()?)
+                .await
+                .map_ttrpc_err(same)?;
+            return Ok(Empty::new());
+        }
+
         ensure_workload_launch_available(&AGENT_CONFIG)?;
         trace_rpc_call!(ctx, "start_container", req);
         is_allowed(&req).await?;
@@ -1238,6 +1305,26 @@ impl agent_ttrpc::AgentService for AgentService {
         ctx: &TtrpcContext,
         req: protocols::agent::RemoveContainerRequest,
     ) -> ttrpc::Result<Empty> {
+        #[cfg(feature = "final-task")]
+        if AGENT_CONFIG.exec_proof_required {
+            is_allowed(&req).await?;
+            let remove = self.final_runtime()?.remove(&req.container_id);
+            if req.timeout == 0 {
+                remove.await.map_ttrpc_err(same)?;
+            } else {
+                tokio::time::timeout(Duration::from_secs(req.timeout.into()), remove)
+                    .await
+                    .map_err(|_| {
+                        ttrpc_error(
+                            ttrpc::Code::DEADLINE_EXCEEDED,
+                            "final task cleanup still pending",
+                        )
+                    })?
+                    .map_ttrpc_err(same)?;
+            }
+            return Ok(Empty::new());
+        }
+
         trace_rpc_call!(ctx, "remove_container", req);
         is_allowed(&req).await?;
         self.do_remove_container(req).await.map_ttrpc_err(same)?;
@@ -1268,6 +1355,21 @@ impl agent_ttrpc::AgentService for AgentService {
         ctx: &TtrpcContext,
         req: protocols::agent::SignalProcessRequest,
     ) -> ttrpc::Result<Empty> {
+        #[cfg(feature = "final-task")]
+        if AGENT_CONFIG.exec_proof_required {
+            is_allowed(&req).await?;
+            if !req.exec_id.is_empty() && req.exec_id != req.container_id {
+                return Err(ttrpc_error(
+                    ttrpc::Code::INVALID_ARGUMENT,
+                    "final task init ID mismatch",
+                ));
+            }
+            self.final_runtime()?
+                .signal(&req.container_id, req.signal as i32)
+                .map_ttrpc_err(same)?;
+            return Ok(Empty::new());
+        }
+
         trace_rpc_call!(ctx, "signal_process", req);
         is_allowed(&req).await?;
         self.do_signal_process(req).await.map_ttrpc_err(same)?;
@@ -1279,6 +1381,26 @@ impl agent_ttrpc::AgentService for AgentService {
         ctx: &TtrpcContext,
         req: protocols::agent::WaitProcessRequest,
     ) -> ttrpc::Result<WaitProcessResponse> {
+        #[cfg(feature = "final-task")]
+        if AGENT_CONFIG.exec_proof_required {
+            is_allowed(&req).await?;
+            if req.exec_id != req.container_id {
+                return Err(ttrpc_error(
+                    ttrpc::Code::INVALID_ARGUMENT,
+                    "final task init ID mismatch",
+                ));
+            }
+            let status = self
+                .final_runtime()?
+                .wait(&req.container_id)
+                .await
+                .map_ttrpc_err(same)?;
+            return Ok(WaitProcessResponse {
+                status,
+                ..Default::default()
+            });
+        }
+
         trace_rpc_call!(ctx, "wait_process", req);
         is_allowed(&req).await?;
         self.do_wait_process(req).await.map_ttrpc_err(same)
@@ -1379,6 +1501,30 @@ impl agent_ttrpc::AgentService for AgentService {
         _ctx: &TtrpcContext,
         req: protocols::agent::WriteStreamRequest,
     ) -> ttrpc::Result<WriteStreamResponse> {
+        #[cfg(feature = "final-task")]
+        if AGENT_CONFIG.exec_proof_required {
+            is_allowed(&req).await?;
+            if req.exec_id != req.container_id {
+                return Err(ttrpc_error(
+                    ttrpc::Code::INVALID_ARGUMENT,
+                    "final task init ID mismatch",
+                ));
+            }
+            let runtime = self.final_runtime()?;
+            let length = if req.data.is_empty() {
+                runtime.close_stdin(&req.container_id).map_ttrpc_err(same)?;
+                0
+            } else {
+                runtime
+                    .write_stdin(&req.container_id, &req.data)
+                    .map_ttrpc_err(same)?
+            };
+            return Ok(WriteStreamResponse {
+                len: length as u32,
+                ..Default::default()
+            });
+        }
+
         is_allowed(&req).await?;
         self.do_write_stream(req).await.map_ttrpc_err(same)
     }
@@ -1388,6 +1534,27 @@ impl agent_ttrpc::AgentService for AgentService {
         _ctx: &TtrpcContext,
         req: protocols::agent::ReadStreamRequest,
     ) -> ttrpc::Result<ReadStreamResponse> {
+        #[cfg(feature = "final-task")]
+        if AGENT_CONFIG.exec_proof_required {
+            if req.exec_id != req.container_id {
+                return Err(ttrpc_error(
+                    ttrpc::Code::INVALID_ARGUMENT,
+                    "final task init ID mismatch",
+                ));
+            }
+            let mut data = self
+                .final_runtime()?
+                .read_stdout(&req.container_id, req.len as usize)
+                .map_ttrpc_err(same)?;
+            if is_allowed(&req).await.is_err() {
+                data.clear();
+            }
+            return Ok(ReadStreamResponse {
+                data,
+                ..Default::default()
+            });
+        }
+
         let mut response = self.do_read_stream(&req, true).await.map_ttrpc_err(same)?;
         if is_allowed(&req).await.is_err() {
             // Policy does not allow reading logs, so we redact the log messages.
@@ -1401,6 +1568,27 @@ impl agent_ttrpc::AgentService for AgentService {
         _ctx: &TtrpcContext,
         req: protocols::agent::ReadStreamRequest,
     ) -> ttrpc::Result<ReadStreamResponse> {
+        #[cfg(feature = "final-task")]
+        if AGENT_CONFIG.exec_proof_required {
+            if req.exec_id != req.container_id {
+                return Err(ttrpc_error(
+                    ttrpc::Code::INVALID_ARGUMENT,
+                    "final task init ID mismatch",
+                ));
+            }
+            let mut data = self
+                .final_runtime()?
+                .read_stderr(&req.container_id, req.len as usize)
+                .map_ttrpc_err(same)?;
+            if is_allowed(&req).await.is_err() {
+                data.clear();
+            }
+            return Ok(ReadStreamResponse {
+                data,
+                ..Default::default()
+            });
+        }
+
         let mut response = self.do_read_stream(&req, false).await.map_ttrpc_err(same)?;
         if is_allowed(&req).await.is_err() {
             // Policy does not allow reading logs, so we redact the log messages.
@@ -1414,6 +1602,21 @@ impl agent_ttrpc::AgentService for AgentService {
         ctx: &TtrpcContext,
         req: protocols::agent::CloseStdinRequest,
     ) -> ttrpc::Result<Empty> {
+        #[cfg(feature = "final-task")]
+        if AGENT_CONFIG.exec_proof_required {
+            is_allowed(&req).await?;
+            if req.exec_id != req.container_id {
+                return Err(ttrpc_error(
+                    ttrpc::Code::INVALID_ARGUMENT,
+                    "final task init ID mismatch",
+                ));
+            }
+            self.final_runtime()?
+                .close_stdin(&req.container_id)
+                .map_ttrpc_err(same)?;
+            return Ok(Empty::new());
+        }
+
         // The stdin will be closed when EOF is got in rpc `write_stdin`[runtime-rs]
         // so this rpc will not be called anymore by runtime-rs.
 
@@ -2350,6 +2553,8 @@ pub async fn start(
         exec_tasks,
         #[cfg(feature = "launch-admission")]
         crate::launch_admission::AdmissionRuntime::default(),
+        #[cfg(feature = "final-task")]
+        None,
     )
     .await
 }
@@ -2377,9 +2582,86 @@ pub async fn start_with_preparation_admission(
         #[cfg(feature = "exec-observer")]
         exec_tasks,
         crate::launch_admission::AdmissionRuntime::with_gate(gate),
+        #[cfg(feature = "final-task")]
+        None,
     )
     .await
 }
+
+/// Trusted embedding hook. Host requests never install runtime state or leases.
+#[cfg(feature = "final-task")]
+#[allow(dead_code)]
+pub async fn start_with_final_tasks(
+    s: Arc<Mutex<Sandbox>>,
+    server_address: &str,
+    init_mode: bool,
+    oma: Option<mem_agent::agent::MemAgent>,
+    exec_observer: Observer,
+    exec_tasks: SharedExecTasks,
+    runtime: crate::final_task_runtime::FinalTaskRuntime,
+) -> Result<TtrpcServer> {
+    start_impl(
+        s,
+        server_address,
+        init_mode,
+        oma,
+        exec_observer,
+        exec_tasks,
+        crate::launch_admission::AdmissionRuntime::default(),
+        Some(runtime),
+    )
+    .await
+}
+
+/// Trusted embedding hook for admission and final tasks in the same service.
+/// The caller retains responsibility for trusted provisioning, staging custody
+/// leases into this runtime, and keeping its protected-export owner alive.
+/// Host requests cannot install either the gate or the runtime.
+#[cfg(feature = "final-task")]
+#[allow(dead_code)]
+pub async fn start_with_preparation_and_final_tasks(
+    s: Arc<Mutex<Sandbox>>,
+    server_address: &str,
+    init_mode: bool,
+    oma: Option<mem_agent::agent::MemAgent>,
+    exec_observer: Observer,
+    exec_tasks: SharedExecTasks,
+    gate: Arc<execution_proof_handoff::admission::GuestAdmissionGate>,
+    runtime: crate::final_task_runtime::FinalTaskRuntime,
+) -> Result<TtrpcServer> {
+    start_impl(
+        s,
+        server_address,
+        init_mode,
+        oma,
+        exec_observer,
+        exec_tasks,
+        crate::launch_admission::AdmissionRuntime::with_gate(gate),
+        Some(runtime),
+    )
+    .await
+}
+
+/// Closed host-management surface for the explicit GCP proof profile. Trusted
+/// startup owns the runtime, custody channels, configuration and exporter owner;
+/// host RPCs cannot install them. Unlisted and future methods are unregistered.
+#[cfg(feature = "gcp-proof-startup")]
+#[allow(dead_code)]
+pub async fn start_gcp_proof(
+    server_address: &str,
+    exec_observer: Observer,
+    runtime: crate::final_task_runtime::FinalTaskRuntime,
+) -> Result<TtrpcServer> {
+    anyhow::ensure!(
+        AGENT_CONFIG.exec_proof_required,
+        "GCP proof service requires the proof-only task path"
+    );
+    gcp_rpc::start_gcp_proof(server_address, exec_observer, runtime)
+}
+
+#[cfg(feature = "gcp-proof-startup")]
+#[path = "gcp_rpc.rs"]
+mod gcp_rpc;
 
 async fn start_impl(
     s: Arc<Mutex<Sandbox>>,
@@ -2390,11 +2672,14 @@ async fn start_impl(
     #[cfg(feature = "exec-observer")] exec_tasks: SharedExecTasks,
     #[cfg(feature = "launch-admission")]
     preparation_admission: crate::launch_admission::AdmissionRuntime,
+    #[cfg(feature = "final-task")] final_tasks: Option<crate::final_task_runtime::FinalTaskRuntime>,
 ) -> Result<TtrpcServer> {
     let agent_service = Box::new(AgentService {
         sandbox: s,
         init_mode,
         oma,
+        #[cfg(feature = "final-task")]
+        final_tasks,
         #[cfg(feature = "launch-admission")]
         preparation_admission,
         #[cfg(feature = "exec-observer")]
@@ -3246,6 +3531,23 @@ mod tests {
         assert_eq!(s.hooks, oci.hooks().clone());
     }
 
+    #[cfg(feature = "final-task")]
+    #[tokio::test]
+    async fn final_task_factory_is_absent_without_trusted_injection() {
+        let logger = slog::Logger::root(slog::Discard, o!());
+        let service = AgentService {
+            sandbox: Arc::new(Mutex::new(Sandbox::new(&logger).unwrap())),
+            init_mode: true,
+            final_tasks: None,
+            oma: None,
+            preparation_admission: crate::launch_admission::AdmissionRuntime::default(),
+            exec_observer: None,
+            exec_tasks: Arc::new(std::sync::Mutex::new(ExecTasks::default())),
+        };
+        assert!(service.final_runtime().is_err());
+        assert!(service.final_observer().is_err());
+    }
+
     #[tokio::test]
     async fn test_update_interface() {
         let logger = slog::Logger::root(slog::Discard, o!());
@@ -3254,6 +3556,8 @@ mod tests {
         let agent_service = Box::new(AgentService {
             sandbox: Arc::new(Mutex::new(sandbox)),
             init_mode: true,
+            #[cfg(feature = "final-task")]
+            final_tasks: None,
             oma: None,
             #[cfg(feature = "launch-admission")]
             preparation_admission: crate::launch_admission::AdmissionRuntime::default(),
@@ -3278,6 +3582,8 @@ mod tests {
         let agent_service = Box::new(AgentService {
             sandbox: Arc::new(Mutex::new(sandbox)),
             init_mode: true,
+            #[cfg(feature = "final-task")]
+            final_tasks: None,
             oma: None,
             #[cfg(feature = "launch-admission")]
             preparation_admission: crate::launch_admission::AdmissionRuntime::default(),
@@ -3302,6 +3608,8 @@ mod tests {
         let agent_service = Box::new(AgentService {
             sandbox: Arc::new(Mutex::new(sandbox)),
             init_mode: true,
+            #[cfg(feature = "final-task")]
+            final_tasks: None,
             oma: None,
             #[cfg(feature = "launch-admission")]
             preparation_admission: crate::launch_admission::AdmissionRuntime::default(),
@@ -3446,6 +3754,8 @@ mod tests {
             let agent_service = Box::new(AgentService {
                 sandbox: Arc::new(Mutex::new(sandbox)),
                 init_mode: true,
+                #[cfg(feature = "final-task")]
+                final_tasks: None,
                 oma: None,
                 #[cfg(feature = "launch-admission")]
                 preparation_admission: crate::launch_admission::AdmissionRuntime::default(),
@@ -3940,6 +4250,8 @@ OtherField:other
         let agent_service = Box::new(AgentService {
             sandbox: Arc::new(Mutex::new(sandbox)),
             init_mode: true,
+            #[cfg(feature = "final-task")]
+            final_tasks: None,
             oma: None,
             #[cfg(feature = "launch-admission")]
             preparation_admission: crate::launch_admission::AdmissionRuntime::default(),
@@ -4155,6 +4467,8 @@ COMMIT
         let agent_service = Arc::new(AgentService {
             sandbox: Arc::new(Mutex::new(sandbox)),
             init_mode: true,
+            #[cfg(feature = "final-task")]
+            final_tasks: None,
             oma: None,
             #[cfg(feature = "launch-admission")]
             preparation_admission: crate::launch_admission::AdmissionRuntime::default(),

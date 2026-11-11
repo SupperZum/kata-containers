@@ -45,12 +45,16 @@ mod device;
 #[cfg(feature = "exec-observer")]
 mod exec_observer;
 mod features;
+#[cfg(feature = "final-task")]
+pub mod final_task;
+#[cfg(feature = "final-task")]
+pub mod final_task_runtime;
+#[cfg(feature = "protected-export-gcp-tdx")]
+pub mod gcp_protected_export;
 mod guest_extension_image;
 mod initdata;
 #[cfg(feature = "launch-admission")]
 mod launch_admission;
-#[cfg(feature = "rootfs-custody")]
-pub mod rootfs_custody;
 mod linux_abi;
 mod metrics;
 mod mount;
@@ -59,7 +63,11 @@ mod netlink;
 mod network;
 mod passfd_io;
 mod pci;
+#[cfg(feature = "protected-export")]
+pub mod protected_export;
 pub mod random;
+#[cfg(feature = "rootfs-custody")]
+pub mod rootfs_custody;
 mod sandbox;
 mod signal;
 mod storage;

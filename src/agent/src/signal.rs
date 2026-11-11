@@ -7,16 +7,17 @@
 use crate::sandbox::Sandbox;
 use anyhow::{anyhow, Result};
 use capctl::prctl::set_subreaper;
-use nix::sys::wait::WaitPidFlag;
-use nix::sys::wait::{self, WaitStatus};
-use nix::unistd;
+use nix::sys::wait::WaitStatus;
+#[cfg(any(not(feature = "exec-observer"), test))]
+use nix::sys::wait::{self, WaitPidFlag};
+#[cfg(any(not(feature = "exec-observer"), test))]
+use nix::unistd::Pid;
 use slog::{error, info, o, Logger};
 use std::sync::Arc;
 use tokio::select;
 use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::watch::Receiver;
 use tokio::sync::Mutex;
-use unistd::Pid;
 
 // Offset added to a signal number to derive the exit code of a process that
 // was terminated by that signal, following the conventional shell semantics
@@ -149,15 +150,9 @@ async fn reap_observed_status(
 ) -> Result<Option<(WaitStatus, Option<crate::exec_observer::TaskIdentity>)>> {
     let _wait = rustjail::container::WAIT_PID_LOCKER.lock().await;
     let _gate = observer.wait_guard()?;
-    let status = match wait::waitpid(
-        Some(Pid::from_raw(-1)),
-        Some(WaitPidFlag::WNOHANG | WaitPidFlag::__WALL),
-    ) {
-        Ok(WaitStatus::StillAlive) | Err(nix::errno::Errno::ECHILD) => return Ok(None),
-        Ok(status) => status,
-        Err(error) => return Err(anyhow!(error).context("observer waitpid failed")),
+    let Some(status) = observer.poll_kernel_wait()? else {
+        return Ok(None);
     };
-    observer.route_wait(status)?;
     let identity = if exit_code_from_wait_status(status).is_some() {
         let pid = status
             .pid()

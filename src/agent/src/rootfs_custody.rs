@@ -187,9 +187,76 @@ impl ReceiverFactory {
             channel: Some(channel),
             phase: Phase::SendChallenge,
             challenge: Some(challenge),
-            configuration: Some(configuration),
+            configuration: Some(AdmissionConfiguration::Legacy(configuration)),
             verifier: None,
             admission: None,
+            #[cfg(feature = "protected-export")]
+            admission_bundle: None,
+            admission_descriptor: None,
+            announcement: None,
+            origin: None,
+            provenance: None,
+            pending_view: None,
+            validated: None,
+            commit: None,
+            ack: None,
+            lease: None,
+            spec: Some(spec),
+            permit: Some(self.reserve()?),
+            limits,
+            deadline,
+            expected_context: None,
+            expected_spec,
+            expected_manifest,
+            expected_policy,
+            published: false,
+            ack_sent: false,
+            duplicate_finalized: false,
+        })
+    }
+    #[cfg(feature = "protected-export-gcp-tdx")]
+    pub fn begin_gcp(
+        &self,
+        channel: StartupBoundChannel,
+        configuration: execution_proof_handoff::admission::gcp::GcpGuestAdmissionConfig,
+        spec: BoundEffectiveSpec,
+        limits: ReceiverLimits,
+    ) -> Result<ReceiverOwner, ReceiverError> {
+        limits.validate()?;
+        if channel.role() != Role::Kata {
+            return Err(ReceiverError::WrongRole);
+        }
+        let expected_spec =
+            decode::<48>(&configuration.expected_grant.binding.effective_launch_sha384)?;
+        if spec.sha384() != configuration.expected_grant.binding.effective_launch_sha384 {
+            return Err(ReceiverError::BindingMismatch);
+        }
+        let expected_manifest = decode::<32>(
+            &configuration
+                .expected_grant
+                .binding
+                .selected_manifest_sha256,
+        )?;
+        let expected_policy =
+            decode::<48>(&configuration.expected_grant.binding.image_policy_sha384)?;
+        let grant = configuration
+            .expected_grant
+            .digest_sha384()
+            .map_err(|_| ReceiverError::InvalidConfiguration)?;
+        let challenge = ReceiverChallenge::new(&channel, decode::<48>(&grant)?)
+            .map_err(ReceiverError::Enrollment)?;
+        let deadline = Instant::now()
+            .checked_add(limits.wall_time)
+            .ok_or(ReceiverError::InvalidConfiguration)?;
+        Ok(ReceiverOwner {
+            channel: Some(channel),
+            phase: Phase::SendChallenge,
+            challenge: Some(challenge),
+            configuration: Some(AdmissionConfiguration::Gcp(configuration)),
+            verifier: None,
+            admission: None,
+            #[cfg(feature = "protected-export")]
+            admission_bundle: None,
             admission_descriptor: None,
             announcement: None,
             origin: None,
@@ -245,15 +312,69 @@ enum Phase {
     Terminal,
 }
 
+// Internal dispatch preserves the exact legacy verifier path. New GCP input
+// can enter only through its separate trusted constructor and strong verifier.
+enum AdmissionConfiguration {
+    Legacy(GuestAdmissionConfig),
+    #[cfg(feature = "protected-export-gcp-tdx")]
+    Gcp(execution_proof_handoff::admission::gcp::GcpGuestAdmissionConfig),
+}
+impl AdmissionConfiguration {
+    fn into_verifier(
+        self,
+        enrollment: execution_proof_handoff::admission::PendingReceiverEnrollment,
+    ) -> Result<AdmissionVerifier, ReceiverEnrollmentError> {
+        match self {
+            Self::Legacy(config) => Ok(AdmissionVerifier::Legacy(ReceiverAdmissionVerifier::new(
+                config, enrollment,
+            )?)),
+            #[cfg(feature = "protected-export-gcp-tdx")]
+            Self::Gcp(config) => Ok(AdmissionVerifier::Gcp(
+                execution_proof_handoff::admission::GcpReceiverAdmissionVerifier::new(
+                    config, enrollment,
+                )?,
+            )),
+        }
+    }
+}
+enum AdmissionVerifier {
+    Legacy(ReceiverAdmissionVerifier),
+    #[cfg(feature = "protected-export-gcp-tdx")]
+    Gcp(execution_proof_handoff::admission::GcpReceiverAdmissionVerifier),
+}
+impl AdmissionVerifier {
+    fn verify_bundle(
+        &self,
+        grant: &[u8],
+        aggregate: &[u8],
+        receipt: &[u8],
+    ) -> Result<execution_proof_handoff::admission::AdmissionCheck, GuestAdmissionError> {
+        match self {
+            Self::Legacy(value) => value.verify_bundle(grant, aggregate, receipt),
+            #[cfg(feature = "protected-export-gcp-tdx")]
+            Self::Gcp(value) => value.verify_bundle(grant, aggregate, receipt),
+        }
+    }
+    fn take_verified(&self) -> Result<VerifiedReceiverAdmission, GuestAdmissionError> {
+        match self {
+            Self::Legacy(value) => value.take_verified(),
+            #[cfg(feature = "protected-export-gcp-tdx")]
+            Self::Gcp(value) => value.take_verified(),
+        }
+    }
+}
+
 /// One non-Clone, non-restorable receiver transaction. Only metadata tombstones
 /// remain after the lease is taken; retries never create another view or lease.
 pub struct ReceiverOwner {
     channel: Option<StartupBoundChannel>,
     phase: Phase,
     challenge: Option<ReceiverChallenge>,
-    configuration: Option<GuestAdmissionConfig>,
-    verifier: Option<ReceiverAdmissionVerifier>,
+    configuration: Option<AdmissionConfiguration>,
+    verifier: Option<AdmissionVerifier>,
     admission: Option<VerifiedReceiverAdmission>,
+    #[cfg(feature = "protected-export")]
+    admission_bundle: Option<Vec<u8>>,
     admission_descriptor: Option<AdmissionDescriptor>,
     announcement: Option<CustodyAnnouncement>,
     origin: Option<OwnedFd>,
@@ -340,13 +461,11 @@ impl ReceiverOwner {
                     )
                     .map_err(ReceiverError::Enrollment)?;
                 self.verifier = Some(
-                    ReceiverAdmissionVerifier::new(
-                        self.configuration
-                            .take()
-                            .ok_or(ReceiverError::Unavailable)?,
-                        enrollment,
-                    )
-                    .map_err(ReceiverError::Enrollment)?,
+                    self.configuration
+                        .take()
+                        .ok_or(ReceiverError::Unavailable)?
+                        .into_verifier(enrollment)
+                        .map_err(ReceiverError::Enrollment)?,
                 );
                 self.phase = Phase::Admission;
                 Ok(ReceiverProgress::Advanced)
@@ -422,6 +541,10 @@ impl ReceiverOwner {
         }
         self.expected_context = Some(decode::<48>(admission.context_digest())?);
         self.admission = Some(admission);
+        #[cfg(feature = "protected-export")]
+        {
+            self.admission_bundle = Some(bytes);
+        }
         self.admission_descriptor = Some(description);
         self.phase = Phase::Announcement;
         Ok(ReceiverProgress::Advanced)
@@ -614,12 +737,23 @@ impl ReceiverOwner {
         // All checks and all fallible operations finish before this publication.
         // This one owned value associates the P, admission, actual view and its
         // capacity permit. No detached lookup or reconstructed lease is needed.
+        #[cfg(feature = "protected-export")]
+        let public_evidence = ReceiverEvidence {
+            admission: self
+                .admission_bundle
+                .take()
+                .ok_or(ReceiverError::Unavailable)?,
+            announcement: announcement.encode().map_err(ReceiverError::Protocol)?,
+            validated_receipt: validated.encode().map_err(ReceiverError::Protocol)?,
+        };
         self.lease = Some(PreparedRootfsLease {
             view: self.pending_view.take().ok_or(ReceiverError::Unavailable)?,
             admission: self.admission.take().ok_or(ReceiverError::Unavailable)?,
             spec: self.spec.take().ok_or(ReceiverError::Unavailable)?,
             provenance: self.provenance.take().ok_or(ReceiverError::Unavailable)?,
             record: commit.record.clone(),
+            #[cfg(feature = "protected-export")]
+            public_evidence,
             _permit: self.permit.take().ok_or(ReceiverError::Unavailable)?,
         });
         self.commit = Some(commit);
@@ -669,6 +803,21 @@ impl ReceiverOwner {
         }
         self.lease.take().ok_or(ReceiverError::AlreadyTaken)
     }
+    /// Transfer the authenticated role channel only after the first final ACK
+    /// was queued and the sole usable lease was transferred. The production
+    /// owner may then send bounded public result frames on this same channel.
+    #[cfg(feature = "gcp-proof-startup")]
+    pub(crate) fn take_completed_channel(&mut self) -> Result<StartupBoundChannel, ReceiverError> {
+        if self.phase != Phase::Finalized
+            || !self.published
+            || !self.ack_sent
+            || self.lease.is_some()
+        {
+            return Err(ReceiverError::NotReady);
+        }
+        self.channel.take().ok_or(ReceiverError::AlreadyTaken)
+    }
+
     /// Local cancellation closes only owned references. It cannot revoke a
     /// lease already transferred to another trusted task-lifetime owner.
     pub fn cancel(&mut self) {
@@ -682,6 +831,10 @@ impl ReceiverOwner {
         self.configuration = None;
         self.verifier = None;
         self.admission = None;
+        #[cfg(feature = "protected-export")]
+        {
+            self.admission_bundle = None;
+        }
         self.spec = None;
         self.provenance = None;
     }
@@ -692,8 +845,16 @@ impl Drop for ReceiverOwner {
     }
 }
 
-/// A receiver-local, one-use ownership association. Exported P data alone cannot
-/// reconstruct this object after a restart, cancellation or transferred lease.
+/// Verified public frames retained for protected execution export.
+#[cfg(feature = "protected-export")]
+pub(crate) struct ReceiverEvidence {
+    pub(crate) admission: Vec<u8>,
+    pub(crate) announcement: Vec<u8>,
+    pub(crate) validated_receipt: Vec<u8>,
+}
+
+/// A receiver-local, one-use lease for the verified filesystem view. Public
+/// preparation data cannot recreate the lease after cancellation or transfer.
 pub struct PreparedRootfsLease {
     // Dependency order: actual view and admission close before capacity returns.
     view: ReceivedMountedView,
@@ -701,6 +862,8 @@ pub struct PreparedRootfsLease {
     spec: BoundEffectiveSpec,
     provenance: PreparationProvenance,
     record: PreparationRecord,
+    #[cfg(feature = "protected-export")]
+    public_evidence: ReceiverEvidence,
     _permit: ReceiverPermit,
 }
 impl PreparedRootfsLease {
@@ -718,6 +881,58 @@ impl PreparedRootfsLease {
     }
     pub fn candidate_spec(&self) -> &BoundEffectiveSpec {
         &self.spec
+    }
+
+    #[cfg(feature = "final-task")]
+    pub(crate) fn into_execution(self) -> PreparedExecutionLease {
+        PreparedExecutionLease {
+            view: self.view.into_execution(),
+            admission: self.admission,
+            spec: self.spec,
+            _provenance: self.provenance,
+            record: self.record,
+            #[cfg(feature = "protected-export")]
+            public_evidence: self.public_evidence,
+            _permit: self._permit,
+        }
+    }
+}
+
+/// Private one-way transition from receiver publication to task creation.
+/// Keep this owner until every child that inherited an execution FD is reaped.
+#[cfg(feature = "final-task")]
+pub(crate) struct PreparedExecutionLease {
+    view: image_rs::preparation::received_view::ExecutionView,
+    admission: VerifiedReceiverAdmission,
+    spec: BoundEffectiveSpec,
+    _provenance: PreparationProvenance,
+    record: PreparationRecord,
+    #[cfg(feature = "protected-export")]
+    public_evidence: ReceiverEvidence,
+    _permit: ReceiverPermit,
+}
+
+#[cfg(feature = "final-task")]
+impl PreparedExecutionLease {
+    pub(crate) fn view(&self) -> &image_rs::preparation::received_view::ExecutionView {
+        &self.view
+    }
+    pub(crate) fn admission(&self) -> &VerifiedReceiverAdmission {
+        &self.admission
+    }
+    pub(crate) fn spec(&self) -> &BoundEffectiveSpec {
+        &self.spec
+    }
+    pub(crate) fn record(&self) -> &PreparationRecord {
+        &self.record
+    }
+    #[cfg(feature = "protected-export")]
+    pub(crate) fn public_evidence(&self) -> &ReceiverEvidence {
+        &self.public_evidence
+    }
+    #[cfg(feature = "protected-export")]
+    pub(crate) fn provenance(&self) -> &PreparationProvenance {
+        &self._provenance
     }
 }
 
