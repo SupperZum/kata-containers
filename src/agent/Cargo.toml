@@ -118,6 +118,7 @@ protected-export-tdx = ["protected-export", "dep:attester"]
 protected-export-gcp-native = ["final-task-native", "protected-export-gcp-tdx"]
 protected-export-gcp-tdx = ["protected-export", "dep:execution-proof-contract", "dep:attester"]
 gcp-proof-startup = ["protected-export-gcp-tdx", "execution-proof-handoff/gcp-startup"]
+gcp-task-controller = ["dep:execution-proof-contract", "dep:image-rs"]
 protected-export-native = ["final-task-native", "protected-export-tdx"]
 seccomp = ["rustjail/seccomp"]
 agent-policy = ["kata-agent-policy"]
@@ -146,3 +147,8 @@ required-features = ["protected-export-gcp-native"]
 name = "kata-agent-gcp-proof"
 path = "src/bin/gcp_proof.rs"
 required-features = ["gcp-proof-startup"]
+
+[[bin]]
+name = "kata-gcp-task-controller"
+path = "src/bin/gcp_task_controller.rs"
+required-features = ["gcp-task-controller"]
