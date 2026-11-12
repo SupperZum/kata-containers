@@ -41,26 +41,8 @@ const IMAGE_BYTES: usize = startup::MAX_IMAGE_BYTES as usize;
 const IMAGE_INODES: usize = startup::MAX_IMAGE_INODES as usize;
 
 pub(super) fn entrypoint() -> Result<()> {
-    // exec resets dumpability. Establish this before reading the capsule or
-    // starting any worker.
-    ensure!(
-        unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) } == 0,
-        "disable role dumping"
-    );
-    let core = libc::rlimit {
-        rlim_cur: 0,
-        rlim_max: 0,
-    };
-    ensure!(
-        unsafe { libc::setrlimit(libc::RLIMIT_CORE, &core) } == 0,
-        "disable role core dumps"
-    );
+    protect_process()?;
     validate_arguments(std::env::args_os())?;
-    // Before any worker or listener: prevent the bind's initial socket inode
-    // from being publicly accessible before its explicit role-group ownership.
-    unsafe {
-        libc::umask(0o077);
-    }
     ensure!(
         unsafe { libc::getpid() } != 1,
         "Kata proof role requires its preparation owner"
@@ -69,7 +51,8 @@ pub(super) fn entrypoint() -> Result<()> {
     // The inherited capsule hint selects only an owned sealed-public FD.
     let loaded = startup::load(Role::Kata).context("authenticate immutable role closure")?;
     ensure!(
-        loaded.artifacts().config().rpc_policy_sha384 == hash(startup::RPC_POLICY_BYTES),
+        loaded.artifacts().config().rpc_policy_sha384
+            == hash(startup::rpc_policy_bytes(loaded.sandbox_gateway_enabled())),
         "compiled RPC policy mismatch"
     );
     // SAFETY: this dedicated entrypoint owns the inherited startup descriptors,
@@ -84,6 +67,29 @@ pub(super) fn entrypoint() -> Result<()> {
         .build()?;
     runtime.block_on(run(loaded, channel))
 }
+
+pub(super) fn protect_process() -> Result<()> {
+    // exec resets dumpability. Establish this before reading the capsule or
+    // starting any worker.
+    ensure!(
+        unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) } == 0,
+        "disable role dumping"
+    );
+    let core = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    ensure!(
+        unsafe { libc::setrlimit(libc::RLIMIT_CORE, &core) } == 0,
+        "disable role core dumps"
+    );
+    // Before any worker or listener: prevent the bind's initial socket inode
+    // from being publicly accessible before its explicit role-group ownership.
+    unsafe {
+        libc::umask(0o077);
+    }
+    Ok(())
+}
 fn validate_arguments(args: impl IntoIterator<Item = OsString>) -> Result<()> {
     ensure!(
         args.into_iter().count() == 1,
@@ -91,7 +97,7 @@ fn validate_arguments(args: impl IntoIterator<Item = OsString>) -> Result<()> {
     );
     Ok(())
 }
-fn hash(bytes: &[u8]) -> String {
+pub(super) fn hash(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha384};
     Sha384::digest(bytes)
         .iter()
@@ -154,6 +160,23 @@ fn spec_limits() -> EffectiveSpecLimits {
         json_depth: 16,
     }
 }
+
+pub(super) fn parse_effective_spec(bytes: &[u8], sha384: &str) -> Result<BoundEffectiveSpec> {
+    BoundEffectiveSpec::parse(
+        bytes,
+        sha384,
+        &EffectiveSpecPolicy {
+            uid: startup::WORKLOAD_UID,
+            gid: startup::WORKLOAD_GID,
+            seccomp_syscalls: startup::WORKLOAD_SYSCALLS
+                .iter()
+                .map(|name| (*name).into())
+                .collect(),
+        },
+        spec_limits(),
+    )
+    .context("validate signed effective spec")
+}
 fn admission(loaded: &LoadedRole) -> GcpGuestAdmissionConfig {
     let config = loaded.artifacts().config();
     GcpGuestAdmissionConfig {
@@ -183,20 +206,10 @@ async fn run(loaded: LoadedRole, channel: StartupBoundChannel) -> Result<()> {
         .ok_or_else(|| anyhow!("role lifetime invalid"))?;
     let startup_binding = channel.binding_commitment();
     let cid = loaded.plan().container_id.clone();
-    let spec = BoundEffectiveSpec::parse(
+    let spec = parse_effective_spec(
         &loaded.capsule().effective_spec,
         &loaded.plan().effective_spec_sha384,
-        &EffectiveSpecPolicy {
-            uid: startup::WORKLOAD_UID,
-            gid: startup::WORKLOAD_GID,
-            seccomp_syscalls: startup::WORKLOAD_SYSCALLS
-                .iter()
-                .map(|name| (*name).into())
-                .collect(),
-        },
-        spec_limits(),
-    )
-    .context("validate signed effective spec")?;
+    )?;
     let factory = ReceiverFactory::new(1)?;
     let mut receiver = factory.begin_gcp(channel, admission(&loaded), spec, receiver_limits())?;
     // This owner is retained across synchronous parsing/mount calls. Cancellation
@@ -250,10 +263,16 @@ async fn serve(
     channel: &mut StartupBoundChannel,
     deadline: Instant,
 ) -> Result<()> {
-    let _socket_parent = private_socket_parent()?;
+    let socket_parent = private_socket_parent(KATA_SOCKET)?;
     let address = format!("unix://{KATA_SOCKET}");
     let mut server = crate::gcp_rpc::start_gcp_proof(&address, observer.clone(), tasks.clone())?;
-    private_socket_permissions(&_socket_parent)?;
+    let mode = if loaded.sandbox_gateway_enabled() {
+        0o600
+    } else {
+        0o660
+    };
+    let name = std::ffi::CStr::from_bytes_with_nul(b"kata-agent.sock\0")?;
+    private_socket_permissions(&socket_parent, name, mode)?;
     server.start().await?;
     let result = publish_until_stop(loaded, tasks, cid, channel, deadline).await;
     server.stop_listen().await;
@@ -265,7 +284,7 @@ async fn serve(
     shutdown?;
     Ok(())
 }
-fn private_socket_parent() -> Result<File> {
+pub(super) fn private_socket_parent(path: &str) -> Result<File> {
     use std::os::fd::{AsRawFd, FromRawFd};
     let root = File::open("/")?;
     let open = |parent: &File, name: &std::ffi::CStr| -> Result<File> {
@@ -298,15 +317,19 @@ fn private_socket_parent() -> Result<File> {
         "private runtime filesystem rejected"
     );
     ensure!(
-        !std::path::Path::new(KATA_SOCKET).exists(),
+        std::fs::symlink_metadata(path)
+            .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound),
         "private listener already exists"
     );
     Ok(parent)
 }
 
-fn private_socket_permissions(parent: &File) -> Result<()> {
+pub(super) fn private_socket_permissions(
+    parent: &File,
+    name: &std::ffi::CStr,
+    mode: libc::mode_t,
+) -> Result<()> {
     use std::os::fd::AsRawFd;
-    let name = std::ffi::CStr::from_bytes_with_nul(b"kata-agent.sock\0")?;
     let fd = parent.as_raw_fd();
     ensure!(
         unsafe { libc::fchownat(fd, name.as_ptr(), 0, 1001, libc::AT_SYMLINK_NOFOLLOW) } == 0,
@@ -320,7 +343,7 @@ fn private_socket_permissions(parent: &File) -> Result<()> {
                 libc::SYS_fchmodat2,
                 fd,
                 name.as_ptr(),
-                0o660,
+                mode,
                 libc::AT_SYMLINK_NOFOLLOW,
             )
         } == 0,
@@ -332,7 +355,7 @@ fn private_socket_permissions(parent: &File) -> Result<()> {
             && metadata.st_mode & libc::S_IFMT == libc::S_IFSOCK
             && metadata.st_uid == 0
             && metadata.st_gid == 1001
-            && metadata.st_mode & 0o777 == 0o660,
+            && metadata.st_mode & 0o777 == mode,
         "private listener invalid"
     );
     Ok(())
