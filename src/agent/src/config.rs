@@ -17,6 +17,7 @@ use kata_types::config::default::DEFAULT_AGENT_VSOCK_PORT;
 
 const DEBUG_CONSOLE_FLAG: &str = "agent.debug_console";
 const DEV_MODE_FLAG: &str = "agent.devmode";
+const EXEC_PROOF_REQUIRED_OPTION: &str = "agent.exec_proof_required";
 const TRACE_MODE_OPTION: &str = "agent.trace";
 const LOG_LEVEL_OPTION: &str = "agent.log";
 const SERVER_ADDR_OPTION: &str = "agent.server_addr";
@@ -128,6 +129,9 @@ pub enum GuestComponentsProcs {
 pub struct AgentConfig {
     pub debug_console: bool,
     pub dev_mode: bool,
+    /// Opt-in launch block until authenticated execution-proof adapters are available.
+    /// Enforcing this profile also requires authenticating the effective guest configuration.
+    pub exec_proof_required: bool,
     pub log_level: slog::Level,
     pub hotplug_timeout: time::Duration,
     pub cdh_api_timeout: time::Duration,
@@ -163,6 +167,7 @@ pub struct MemAgentConfig {
 pub struct AgentConfigBuilder {
     pub debug_console: Option<bool>,
     pub dev_mode: Option<bool>,
+    pub exec_proof_required: Option<bool>,
     pub log_level: Option<String>,
     pub hotplug_timeout: Option<time::Duration>,
     pub cdh_api_timeout: Option<time::Duration>,
@@ -259,6 +264,7 @@ impl Default for AgentConfig {
         AgentConfig {
             debug_console: false,
             dev_mode: false,
+            exec_proof_required: false,
             log_level: DEFAULT_LOG_LEVEL,
             hotplug_timeout: DEFAULT_HOTPLUG_TIMEOUT,
             cdh_api_timeout: DEFAULT_CDH_API_TIMEOUT,
@@ -297,6 +303,7 @@ impl FromStr for AgentConfig {
         // Overwrite default values with the configuration files ones.
         config_override!(agent_config_builder, agent_config, debug_console);
         config_override!(agent_config_builder, agent_config, dev_mode);
+        config_override!(agent_config_builder, agent_config, exec_proof_required);
         config_override!(
             agent_config_builder,
             agent_config,
@@ -402,6 +409,14 @@ impl FromStr for AgentConfig {
 }
 
 impl AgentConfig {
+    pub fn validate_exec_proof_config(&self) -> Result<()> {
+        ensure!(
+            !self.exec_proof_required || !self.debug_console,
+            "execution proof required: debug console is unsupported"
+        );
+        Ok(())
+    }
+
     #[instrument]
     #[allow(clippy::redundant_closure_call)]
     pub fn from_cmdline(file: &str, args: Vec<String>) -> Result<AgentConfig> {
@@ -437,6 +452,17 @@ impl AgentConfig {
             // parse cmdline flags
             parse_cmdline_param!(param, DEBUG_CONSOLE_FLAG, config.debug_console);
             parse_cmdline_param!(param, DEV_MODE_FLAG, config.dev_mode);
+
+            // Reject malformed proof-required values so they cannot disable the guard.
+            if param == &EXEC_PROOF_REQUIRED_OPTION {
+                bail!("agent.exec_proof_required requires true or false");
+            }
+            if let Some(value) = param.strip_prefix("agent.exec_proof_required=") {
+                config.exec_proof_required = value
+                    .parse::<bool>()
+                    .context("agent.exec_proof_required requires true or false")?;
+                continue;
+            }
 
             // Support "bare" tracing option for backwards compatibility with
             // Kata 1.x.
@@ -887,8 +913,74 @@ mod tests {
         let config: AgentConfig = Default::default();
         assert!(!config.debug_console);
         assert!(!config.dev_mode);
+        assert!(!config.exec_proof_required);
         assert_eq!(config.log_level, DEFAULT_LOG_LEVEL);
         assert_eq!(config.hotplug_timeout, DEFAULT_HOTPLUG_TIMEOUT);
+    }
+
+    #[test]
+    fn test_exec_proof_required_cmdline() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("cmdline");
+        for (contents, expected) in [
+            ("", false),
+            ("agent.exec_proof_required=true", true),
+            ("agent.exec_proof_required=false", false),
+        ] {
+            fs::write(&path, contents).unwrap();
+            let config = AgentConfig::from_cmdline(path.to_str().unwrap(), vec![]).unwrap();
+            assert_eq!(config.exec_proof_required, expected, "{contents}");
+        }
+        for contents in [
+            "agent.exec_proof_required",
+            "agent.exec_proof_required=",
+            "agent.exec_proof_required=invalid",
+            "agent.exec_proof_required=0",
+            "agent.exec_proof_required=true=false",
+        ] {
+            fs::write(&path, contents).unwrap();
+            assert!(
+                AgentConfig::from_cmdline(path.to_str().unwrap(), vec![]).is_err(),
+                "{} must not disable the guard",
+                contents
+            );
+        }
+    }
+
+    #[test]
+    fn test_exec_proof_required_config_file() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("agent.toml");
+        for expected in [false, true] {
+            fs::write(&path, format!("exec_proof_required = {expected}")).unwrap();
+            let config = AgentConfig::from_cmdline(
+                "",
+                vec!["--config".to_owned(), path.to_str().unwrap().to_owned()],
+            )
+            .unwrap();
+            assert_eq!(config.exec_proof_required, expected);
+        }
+        for contents in [
+            "exec_proof_required = 'true'",
+            "exec_proof_required = 'invalid'",
+            "exec_proof_required = 0",
+        ] {
+            fs::write(&path, contents).unwrap();
+            assert!(AgentConfig::from_config_file(path.to_str().unwrap()).is_err());
+        }
+    }
+
+    #[test]
+    fn test_exec_proof_required_rejects_debug_console() {
+        let mut config = AgentConfig {
+            debug_console: true,
+            ..Default::default()
+        };
+        assert!(config.validate_exec_proof_config().is_ok());
+        config.exec_proof_required = true;
+        assert!(config.validate_exec_proof_config().is_err());
+        config.debug_console = false;
+        assert!(config.validate_exec_proof_config().is_ok());
     }
 
     #[test]

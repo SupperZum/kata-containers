@@ -7,16 +7,17 @@
 use crate::sandbox::Sandbox;
 use anyhow::{anyhow, Result};
 use capctl::prctl::set_subreaper;
-use nix::sys::wait::WaitPidFlag;
-use nix::sys::wait::{self, WaitStatus};
-use nix::unistd;
+use nix::sys::wait::WaitStatus;
+#[cfg(any(not(feature = "exec-observer"), test))]
+use nix::sys::wait::{self, WaitPidFlag};
+#[cfg(any(not(feature = "exec-observer"), test))]
+use nix::unistd::Pid;
 use slog::{error, info, o, Logger};
 use std::sync::Arc;
 use tokio::select;
 use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::watch::Receiver;
 use tokio::sync::Mutex;
-use unistd::Pid;
 
 // Offset added to a signal number to derive the exit code of a process that
 // was terminated by that signal, following the conventional shell semantics
@@ -37,6 +38,7 @@ fn exit_code_from_wait_status(wait_status: WaitStatus) -> Option<i32> {
     }
 }
 
+#[cfg(not(feature = "exec-observer"))]
 async fn handle_sigchild(logger: Logger, sandbox: Arc<Mutex<Sandbox>>) -> Result<()> {
     info!(logger, "handling signal"; "signal" => "SIGCHLD");
 
@@ -103,6 +105,7 @@ async fn handle_sigchild(logger: Logger, sandbox: Arc<Mutex<Sandbox>>) -> Result
     }
 }
 
+#[cfg(not(feature = "exec-observer"))]
 pub async fn setup_signal_handler(
     logger: Logger,
     sandbox: Arc<Mutex<Sandbox>>,
@@ -136,6 +139,181 @@ pub async fn setup_signal_handler(
         }
     }
 
+    Ok(())
+}
+
+/// Coordinate waitpid, observer routing and terminal task bookkeeping under one gate.
+#[cfg(feature = "exec-observer")]
+async fn reap_observed_status(
+    observer: &crate::exec_observer::Observer,
+    tasks: &crate::rpc::SharedExecTasks,
+) -> Result<Option<(WaitStatus, Option<crate::exec_observer::TaskIdentity>)>> {
+    let _wait = rustjail::container::WAIT_PID_LOCKER.lock().await;
+    let _gate = observer.wait_guard()?;
+    let Some(status) = observer.poll_kernel_wait()? else {
+        return Ok(None);
+    };
+    let identity = if exit_code_from_wait_status(status).is_some() {
+        let pid = status
+            .pid()
+            .ok_or_else(|| anyhow!("terminal status without PID"))?;
+        tasks
+            .lock()
+            .map_err(|_| anyhow!("task registry poisoned"))?
+            .terminal(pid.as_raw())
+    } else {
+        None
+    };
+    Ok(Some((status, identity)))
+}
+
+/// Route kernel stops before any sandbox/output await. Only registered init exits create jobs.
+#[cfg(feature = "exec-observer")]
+async fn drain_observed_children(
+    logger: &Logger,
+    sandbox: &Arc<Mutex<Sandbox>>,
+    observer: &crate::exec_observer::Observer,
+    tasks: &crate::rpc::SharedExecTasks,
+    exits: &mut tokio::task::JoinSet<Result<()>>,
+) -> Result<()> {
+    loop {
+        let Some((status, identity)) = reap_observed_status(observer, tasks).await? else {
+            break;
+        };
+        if let Some(identity) = identity {
+            while let Some(result) = exits.try_join_next() {
+                observe_exit_job(logger, observer, tasks, result);
+            }
+            // A task registry slot is held until notification completion, bounding live jobs.
+            if exits.len() >= 64 {
+                if let Some(result) = exits.join_next().await {
+                    observe_exit_job(logger, observer, tasks, result);
+                }
+            }
+            exits.spawn(notify_observed_exit(
+                sandbox.clone(),
+                tasks.clone(),
+                identity,
+                status,
+            ));
+        } else if exit_code_from_wait_status(status).is_some() {
+            info!(logger, "unregistered child exited");
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "exec-observer")]
+fn observe_exit_job(
+    logger: &Logger,
+    observer: &crate::exec_observer::Observer,
+    tasks: &crate::rpc::SharedExecTasks,
+    result: std::result::Result<Result<()>, tokio::task::JoinError>,
+) {
+    let error = match result {
+        Ok(Ok(())) => return,
+        Ok(Err(error)) => error,
+        Err(error) => anyhow!(error),
+    };
+    observer.shutdown();
+    if let Ok(mut tasks) = tasks.lock() {
+        tasks.stop_admission();
+    }
+    error!(logger, "exit notification failed"; "error" => error.to_string());
+}
+
+#[cfg(feature = "exec-observer")]
+async fn notify_observed_exit(
+    sandbox: Arc<Mutex<Sandbox>>,
+    tasks: crate::rpc::SharedExecTasks,
+    identity: crate::exec_observer::TaskIdentity,
+    status: WaitStatus,
+) -> Result<()> {
+    let result = async {
+        let notification = {
+            let mut sandbox = sandbox.lock().await;
+            let Some(container) = sandbox.containers.get(&identity.container_id) else {
+                return Ok(());
+            };
+            if container.init_process_pid != identity.pid {
+                return Err(anyhow!("exit task generation mismatch"));
+            }
+            let Some(process) = sandbox.find_process(identity.pid) else {
+                return Ok(());
+            };
+            process.exit_code = exit_code_from_wait_status(status)
+                .ok_or_else(|| anyhow!("nonterminal exit job"))?;
+            let output = process
+                .proc_io
+                .as_mut()
+                .map(|io| std::mem::take(&mut io.wg_output));
+            (
+                output,
+                process.exit_tx.take(),
+                process.term_exit_notifier.clone(),
+            )
+        };
+        // Own this task's original notification objects; no lock or PID lookup after this wait.
+        if let Some(mut output) = notification.0 {
+            output.wait().await;
+        }
+        drop(notification.1);
+        notification.2.notify_waiters();
+        Ok(())
+    }
+    .await;
+    tasks
+        .lock()
+        .map_err(|_| anyhow!("task registry poisoned"))?
+        .finish(&identity);
+    result
+}
+
+#[cfg(feature = "exec-observer")]
+pub async fn setup_signal_handler(
+    logger: Logger,
+    sandbox: Arc<Mutex<Sandbox>>,
+    mut shutdown: Receiver<bool>,
+    observer: crate::exec_observer::Observer,
+    tasks: crate::rpc::SharedExecTasks,
+) -> Result<()> {
+    let logger = logger.new(o!("subsystem" => "signals"));
+    let _stop_owner = scopeguard::guard((observer.clone(), tasks.clone()), |(observer, tasks)| {
+        observer.shutdown();
+        if let Ok(mut tasks) = tasks.lock() {
+            tasks.stop_admission();
+        }
+    });
+    set_subreaper(true).map_err(|e| anyhow!(e).context("failed to setup subreaper"))?;
+    let mut signals = signal(SignalKind::child())?;
+    let mut exits = tokio::task::JoinSet::new();
+    loop {
+        select! {
+            _ = shutdown.changed() => break,
+            _ = signals.recv() => {
+                if let Err(error) = drain_observed_children(&logger, &sandbox, &observer, &tasks, &mut exits).await {
+                    observer.shutdown();
+                    if let Ok(mut tasks) = tasks.lock() { tasks.stop_admission(); }
+                    error!(logger, "observer reaper failed"; "error" => error.to_string());
+                }
+            },
+            Some(result) = exits.join_next(), if !exits.is_empty() => {
+                observe_exit_job(&logger, &observer, &tasks, result);
+            },
+        }
+    }
+    // Main shuts down and joins the ptrace owner while this wait consumer is still running.
+    // A stuck output stream must not keep agent shutdown unbounded.
+    let drain = async {
+        while let Some(result) = exits.join_next().await {
+            observe_exit_job(&logger, &observer, &tasks, result);
+        }
+    };
+    if let Err(error) = tokio::time::timeout(std::time::Duration::from_secs(5), drain).await {
+        exits.abort_all();
+        while exits.join_next().await.is_some() {}
+        return Err(anyhow!(error).context("exit output notification drain timed out"));
+    }
     Ok(())
 }
 
@@ -194,7 +372,17 @@ mod tests {
 
         let (tx, rx) = channel(true);
 
-        let handle = tokio::spawn(setup_signal_handler(logger, sandbox, rx));
+        #[cfg(feature = "exec-observer")]
+        let (observer, owner) = crate::exec_observer::Observer::start(4).unwrap();
+        let handle = tokio::spawn(setup_signal_handler(
+            logger,
+            sandbox,
+            rx,
+            #[cfg(feature = "exec-observer")]
+            observer.clone(),
+            #[cfg(feature = "exec-observer")]
+            Arc::new(std::sync::Mutex::new(crate::rpc::ExecTasks::default())),
+        ));
 
         let timeout = tokio::time::sleep(Duration::from_secs(1));
         pin!(timeout);
@@ -209,5 +397,89 @@ mod tests {
                 panic!("signal thread failed to stop");
             }
         }
+        #[cfg(feature = "exec-observer")]
+        {
+            observer.shutdown();
+            owner.join().unwrap().unwrap();
+        }
+    }
+    /// Check kernel exec and terminal events through the kata-agent wait dispatcher.
+    #[cfg(feature = "exec-observer")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_observer_wait_routing_real_exec_and_terminal() {
+        let mut gate = [-1; 2];
+        assert_eq!(
+            unsafe { libc::pipe2(gate.as_mut_ptr(), libc::O_CLOEXEC) },
+            0
+        );
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0);
+        if pid == 0 {
+            // Use only async-signal-safe syscalls in the child before exec.
+            unsafe {
+                libc::close(gate[1]);
+                libc::alarm(5);
+                let mut go = 0u8;
+                loop {
+                    let n = libc::read(gate[0], (&mut go as *mut u8).cast(), 1);
+                    if n == 1 {
+                        break;
+                    }
+                    if n < 0 && *libc::__errno_location() == libc::EINTR {
+                        continue;
+                    }
+                    libc::_exit(125);
+                }
+                let path = b"/usr/bin/true\0";
+                let args = [path.as_ptr().cast::<libc::c_char>(), std::ptr::null()];
+                let env = [std::ptr::null::<libc::c_char>()];
+                libc::execve(args[0], args.as_ptr(), env.as_ptr());
+                libc::_exit(126);
+            }
+        }
+        unsafe {
+            libc::close(gate[0]);
+        }
+        let (observer, owner) = crate::exec_observer::Observer::start(4).unwrap();
+        let _stop = scopeguard::guard(observer.clone(), |o| o.shutdown());
+        let tasks = Arc::new(std::sync::Mutex::new(crate::rpc::ExecTasks::default()));
+        let attempt = {
+            let _guard = observer.wait_guard().unwrap();
+            let task = tasks
+                .lock()
+                .unwrap()
+                .register("local-reaper-fixture", pid)
+                .unwrap();
+            observer.arm(task).unwrap()
+        };
+        attempt.wait_armed(Duration::from_secs(2)).await.unwrap();
+        assert_eq!(unsafe { libc::write(gate[1], b"G".as_ptr().cast(), 1) }, 1);
+        unsafe {
+            libc::close(gate[1]);
+        }
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !attempt.snapshot().terminal {
+                reap_observed_status(&observer, &tasks).await.unwrap();
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(attempt.snapshot().observed);
+        assert!(tasks
+            .lock()
+            .unwrap()
+            .tasks
+            .get("local-reaper-fixture")
+            .is_none_or(|task| !task.live));
+        tasks.lock().unwrap().finish(attempt.task());
+        assert!(tasks.lock().unwrap().tasks.is_empty());
+        assert_eq!(observer.active_tasks().unwrap(), 0);
+        observer.shutdown();
+        owner.join().unwrap().unwrap();
+        assert_eq!(
+            wait::waitpid(Some(Pid::from_raw(pid)), Some(WaitPidFlag::WNOHANG)),
+            Err(nix::errno::Errno::ECHILD)
+        );
     }
 }

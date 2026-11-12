@@ -25,6 +25,8 @@ extern crate scan_fmt;
 extern crate path_absolutize;
 extern crate regex;
 
+#[cfg(feature = "final-task")]
+pub mod final_task;
 pub mod capabilities;
 pub mod cgroups;
 pub mod cgroups_rs;

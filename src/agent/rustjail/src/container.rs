@@ -1002,7 +1002,7 @@ impl BaseContainer for LinuxContainer {
             .map_err(|e| warn!(logger, "fcntl pfd log FD_CLOEXEC {:?}", e));
 
         let child_logger = logger.new(o!("action" => "child process log"));
-        let log_handler = setup_child_logger(pfd_log.as_fd().as_raw_fd(), child_logger);
+        let log_handler = setup_child_logger(pfd_log.into_raw_fd(), child_logger);
 
         let (prfd, cwfd) = unistd::pipe().context("failed to create pipe")?;
         let (crfd, pwfd) = unistd::pipe().context("failed to create pipe")?;
@@ -1013,8 +1013,8 @@ impl BaseContainer for LinuxContainer {
         let _ = fcntl::fcntl(&pwfd, FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC))
             .map_err(|e| warn!(logger, "fcntl pwfd FD_COLEXEC {:?}", e));
 
-        let mut pipe_r = PipeStream::from_fd(prfd.as_fd().as_raw_fd());
-        let mut pipe_w = PipeStream::from_fd(pwfd.as_fd().as_raw_fd());
+        let mut pipe_r = PipeStream::from_fd(prfd.into_raw_fd());
+        let mut pipe_w = PipeStream::from_fd(pwfd.into_raw_fd());
 
         let child_stdin: std::process::Stdio;
         let child_stdout: std::process::Stdio;
@@ -1668,6 +1668,66 @@ fn setid(uid: Uid, gid: Gid) -> Result<()> {
 }
 
 impl LinuxContainer {
+    /// Release an observer-armed init task without a blocking FIFO open/write.
+    /// The caller retains the attempt owner and kills it on error/cancellation.
+    /// This is an operational wait budget, not a trusted physical exec deadline.
+    #[cfg(feature = "exec-observer")]
+    pub async fn exec_observed(&mut self, timeout: std::time::Duration) -> Result<()> {
+        anyhow::ensure!(
+            self.status() == ContainerState::Created && !timeout.is_zero(),
+            "observed exec requires a created task and a nonzero wait budget"
+        );
+        let spec = self
+            .config
+            .spec
+            .as_ref()
+            .ok_or_else(|| anyhow!("OCI spec was not found"))?;
+        anyhow::ensure!(
+            spec.hooks().is_none(),
+            "observed exec does not support OCI hooks"
+        );
+
+        let fifo = Path::new(&self.root).join(EXEC_FIFO_FILENAME);
+        let retry_delay = std::time::Duration::from_millis(5);
+        let release = async {
+            let fd = loop {
+                match fcntl::open(
+                    &fifo,
+                    OFlag::O_WRONLY | OFlag::O_NONBLOCK | OFlag::O_CLOEXEC,
+                    Mode::empty(),
+                ) {
+                    Ok(fd) => break fd,
+                    Err(Errno::ENXIO | Errno::EINTR) => {
+                        tokio::time::sleep(retry_delay).await;
+                    }
+                    Err(error) => return Err(anyhow!(error).context("open observed exec FIFO")),
+                }
+            };
+            loop {
+                match unistd::write(&fd, &[0]) {
+                    Ok(1) => return Ok(()),
+                    Ok(_) => return Err(anyhow!("observed exec FIFO write made no progress")),
+                    Err(Errno::EAGAIN | Errno::EINTR) => {
+                        tokio::time::sleep(retry_delay).await;
+                    }
+                    Err(error) => return Err(anyhow!(error).context("write observed exec FIFO")),
+                }
+            }
+        };
+        // The only pending operations are async timers; dropping this future
+        // closes its owned writer and leaves no detached worker to release later.
+        tokio::time::timeout(timeout, release)
+            .await
+            .context("observed exec FIFO release timed out")??;
+        info!(self.logger, "container started");
+        self.init_process_start_time = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .context("container start metadata clock is before Unix epoch")?
+            .as_secs();
+        self.status.transition(ContainerState::Running);
+        Ok(())
+    }
+
     pub fn new<T: Into<String> + Display + Clone>(
         id: T,
         base: T,

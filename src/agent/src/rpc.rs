@@ -95,6 +95,9 @@ use crate::{confidential_data_hub, linux_abi::*};
 #[cfg(feature = "devicemapper")]
 use kata_types::dmverity::cleanup_dmverity_devices;
 
+#[cfg(feature = "exec-observer")]
+use crate::exec_observer::{Observer, TaskIdentity};
+
 use crate::trace_rpc_call;
 use crate::tracer::extract_carrier_from_ttrpc;
 
@@ -164,6 +167,17 @@ pub fn ttrpc_error(code: ttrpc::Code, err: impl Debug) -> ttrpc::Error {
     get_rpc_status(code, format!("{err:?}"))
 }
 
+/// No host request or observer result can satisfy the unavailable proof-required launch path.
+fn ensure_workload_launch_available(config: &crate::config::AgentConfig) -> ttrpc::Result<()> {
+    if config.exec_proof_required {
+        return Err(ttrpc_error(
+            ttrpc::Code::UNIMPLEMENTED,
+            "execution proof required: authenticated launch adapters are unavailable",
+        ));
+    }
+    Ok(())
+}
+
 /// Convert SandboxError to ttrpc error with appropriate code.
 /// Process not found errors map to NOT_FOUND, others to INVALID_ARGUMENT.
 fn sandbox_err_to_ttrpc(err: SandboxError) -> ttrpc::Error {
@@ -209,15 +223,149 @@ impl<T> OptionToTtrpcResult<T> for Option<T> {
     }
 }
 
+#[cfg(feature = "exec-observer")]
+const OBSERVER_TASK_LIMIT: usize = 64;
+#[cfg(feature = "exec-observer")]
+const OBSERVER_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[cfg(feature = "exec-observer")]
 #[derive(Clone, Debug)]
+pub(crate) struct LocalExecTask {
+    pub identity: TaskIdentity,
+    pub live: bool,
+}
+
+/// Retain terminal PID tombstones for the lifetime of kata-agent. PID reuse is unsupported.
+#[cfg(feature = "exec-observer")]
+#[derive(Debug, Default)]
+pub(crate) struct ExecTasks {
+    pub tasks: std::collections::HashMap<String, LocalExecTask>,
+    retired: std::collections::HashSet<i32>,
+    exhausted: bool,
+    next_generation: u64,
+}
+
+#[cfg(feature = "exec-observer")]
+impl ExecTasks {
+    pub fn register(&mut self, cid: &str, pid: i32) -> Result<TaskIdentity> {
+        anyhow::ensure!(!self.exhausted, "observer PID history exhausted");
+        anyhow::ensure!(
+            pid > 0 && !self.retired.contains(&pid),
+            "task PID already retired"
+        );
+        anyhow::ensure!(
+            self.tasks.len() < OBSERVER_TASK_LIMIT,
+            "observer task capacity exhausted"
+        );
+        anyhow::ensure!(
+            !self.tasks.contains_key(cid),
+            "container generation still retained"
+        );
+        anyhow::ensure!(
+            self.tasks.values().all(|t| t.identity.pid != pid),
+            "task PID still retained"
+        );
+        self.next_generation = self
+            .next_generation
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("task generation exhausted"))?;
+        let identity = TaskIdentity {
+            container_id: cid.to_owned(),
+            generation: self.next_generation,
+            pid,
+        };
+        self.tasks.insert(
+            cid.to_owned(),
+            LocalExecTask {
+                identity: identity.clone(),
+                live: true,
+            },
+        );
+        Ok(identity)
+    }
+
+    /// Called synchronously with terminal wait routing, before any sandbox/output wait.
+    pub fn terminal(&mut self, pid: i32) -> Option<TaskIdentity> {
+        if self.retired.len() < 4096 || self.retired.contains(&pid) {
+            self.retired.insert(pid);
+        } else {
+            self.exhausted = true;
+        }
+        self.tasks
+            .values_mut()
+            .find(|t| t.identity.pid == pid)
+            .map(|task| {
+                task.live = false;
+                task.identity.clone()
+            })
+    }
+
+    pub fn stop_admission(&mut self) {
+        self.exhausted = true;
+    }
+
+    pub fn finish(&mut self, identity: &TaskIdentity) {
+        if self
+            .tasks
+            .get(&identity.container_id)
+            .is_some_and(|t| &t.identity == identity && !t.live)
+        {
+            self.tasks.remove(&identity.container_id);
+        }
+    }
+}
+
+#[cfg(feature = "exec-observer")]
+pub(crate) type SharedExecTasks = Arc<std::sync::Mutex<ExecTasks>>;
+
+#[derive(Clone)]
+#[cfg_attr(not(feature = "exec-observer"), derive(Debug))]
 pub struct AgentService {
     sandbox: Arc<Mutex<Sandbox>>,
     init_mode: bool,
+    #[cfg(feature = "final-task")]
+    final_tasks: Option<crate::final_task_runtime::FinalTaskRuntime>,
     oma: Option<mem_agent::agent::MemAgent>,
+    #[cfg(feature = "launch-admission")]
+    preparation_admission: crate::launch_admission::AdmissionRuntime,
+    #[cfg(feature = "exec-observer")]
+    exec_observer: Option<Observer>,
+    #[cfg(feature = "exec-observer")]
+    exec_tasks: SharedExecTasks,
+}
+
+#[cfg(feature = "exec-observer")]
+impl std::fmt::Debug for AgentService {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AgentService")
+            .finish_non_exhaustive()
+    }
 }
 
 impl AgentService {
-    #[instrument]
+    #[cfg(feature = "final-task")]
+    fn final_runtime(&self) -> ttrpc::Result<&crate::final_task_runtime::FinalTaskRuntime> {
+        self.final_tasks.as_ref().ok_or_else(|| {
+            ttrpc_error(
+                ttrpc::Code::UNIMPLEMENTED,
+                "execution proof required: trusted final task runtime unavailable",
+            )
+        })
+    }
+
+    #[cfg(feature = "final-task")]
+    fn final_observer(&self) -> ttrpc::Result<&Observer> {
+        self.exec_observer.as_ref().ok_or_else(|| {
+            ttrpc_error(
+                ttrpc::Code::UNIMPLEMENTED,
+                "final task observer unavailable",
+            )
+        })
+    }
+
+    #[cfg_attr(feature = "exec-observer", instrument(skip(self, req)))]
+    #[cfg_attr(not(feature = "exec-observer"), instrument)]
     async fn do_create_container(
         &self,
         req: protocols::agent::CreateContainerRequest,
@@ -246,7 +394,9 @@ impl AgentService {
 
         let container_name = k8s::container_name(&oci);
 
+        #[cfg(not(feature = "exec-observer"))]
         info!(sl(), "receive createcontainer, spec: {:?}", &oci);
+        #[cfg(not(feature = "exec-observer"))]
         info!(
             sl(),
             "receive createcontainer, storages: {:?}", &req.storages
@@ -317,6 +467,32 @@ impl AgentService {
         // Append guest hooks
         append_guest_hooks(&s, &mut oci)?;
 
+        #[cfg(feature = "exec-observer")]
+        if self.exec_observer.is_some() {
+            anyhow::ensure!(
+                oci.hooks().is_none(),
+                "exec observer does not support OCI hooks"
+            );
+            anyhow::ensure!(
+                oci.process()
+                    .as_ref()
+                    .is_some_and(|p| p.no_new_privileges() == Some(true)),
+                "exec observer requires no_new_privileges"
+            );
+            let tasks = self
+                .exec_tasks
+                .lock()
+                .map_err(|_| anyhow!("task registry poisoned"))?;
+            anyhow::ensure!(
+                !tasks.exhausted && tasks.tasks.len() < OBSERVER_TASK_LIMIT,
+                "exec observer admission exhausted"
+            );
+            anyhow::ensure!(
+                !tasks.tasks.contains_key(&cid),
+                "container generation still retained"
+            );
+        }
+
         // write spec to bundle path, hooks might
         // read ocispec
         let olddir = setup_bundle(&cid, &mut oci)?;
@@ -384,6 +560,25 @@ impl AgentService {
 
         s.update_shared_pidns(&ctr)?;
         s.setup_shared_mounts(&ctr, &req.shared_mounts)?;
+        #[cfg(feature = "exec-observer")]
+        if let Some(observer) = &self.exec_observer {
+            let registration = (|| {
+                let _gate = observer.wait_guard()?;
+                self.exec_tasks
+                    .lock()
+                    .map_err(|_| anyhow!("task registry poisoned"))?
+                    .register(&cid, ctr.init_process_pid)
+            })();
+            if let Err(error) = registration {
+                // A reaped PID may already belong to a different task. Never pass it to destroy's kill loop.
+                let retired_pid = ctr.init_process_pid;
+                ctr.processes.retain(|_, p| p.pid != retired_pid);
+                ctr.init_process_pid = -1;
+                let _ = ctr.destroy().await;
+                remove_container_resources(&mut s, &cid).await?;
+                return Err(error);
+            }
+        }
         s.add_container(ctr);
         info!(sl(), "created container!");
 
@@ -392,6 +587,10 @@ impl AgentService {
 
     #[instrument]
     async fn do_start_container(&self, req: protocols::agent::StartContainerRequest) -> Result<()> {
+        #[cfg(feature = "exec-observer")]
+        if self.exec_observer.is_some() {
+            return self.do_start_container_observed(req).await;
+        }
         let mut s = self.sandbox.lock().await;
         let sid = s.id.clone();
         let cid = req.container_id.clone();
@@ -413,6 +612,75 @@ impl AgentService {
             .ok_or_else(|| anyhow!("Invalid container id"))?;
 
         ctr.exec().await
+    }
+
+    #[cfg(feature = "exec-observer")]
+    #[instrument(skip(self, req))]
+    async fn do_start_container_observed(
+        &self,
+        req: protocols::agent::StartContainerRequest,
+    ) -> Result<()> {
+        let observer = self
+            .exec_observer
+            .as_ref()
+            .ok_or_else(|| anyhow!("observer unavailable"))?;
+        let cid = req.container_id;
+        let attempt = {
+            let mut sandbox = self.sandbox.lock().await;
+            let sid = sandbox.id.clone();
+            let ctr = sandbox
+                .get_container(&cid)
+                .ok_or_else(|| anyhow!("Invalid container id"))?;
+            let pid = ctr.init_process_pid;
+            if sid != cid {
+                if let Ok(cg_path) = ctr.cgroup_manager.as_ref().get_cgroup_path("memory") {
+                    let rx = notifier::notify_oom(cid.as_str(), cg_path.to_string()).await?;
+                    sandbox.run_oom_event_monitor(rx, cid.clone()).await;
+                }
+            }
+            let _gate = observer.wait_guard()?;
+            let tasks = self
+                .exec_tasks
+                .lock()
+                .map_err(|_| anyhow!("task registry poisoned"))?;
+            let task = tasks
+                .tasks
+                .get(&cid)
+                .ok_or_else(|| anyhow!("missing task generation"))?;
+            anyhow::ensure!(
+                !tasks.exhausted && task.live && task.identity.pid == pid,
+                "stale task generation"
+            );
+            observer.arm(task.identity.clone())?
+        };
+        attempt.wait_armed(OBSERVER_TIMEOUT).await?;
+        {
+            let mut sandbox = self.sandbox.lock().await;
+            let ctr = sandbox
+                .get_container(&cid)
+                .ok_or_else(|| anyhow!("container removed before release"))?;
+            {
+                let _gate = observer.wait_guard()?;
+                let tasks = self
+                    .exec_tasks
+                    .lock()
+                    .map_err(|_| anyhow!("task registry poisoned"))?;
+                anyhow::ensure!(
+                    tasks.tasks.get(&cid).is_some_and(|task| task.live
+                        && &task.identity == attempt.task()
+                        && task.identity.pid == ctr.init_process_pid),
+                    "task generation changed before release"
+                );
+                anyhow::ensure!(
+                    attempt.snapshot().armed && attempt.snapshot().failure.is_none(),
+                    "observer arm no longer valid"
+                );
+            }
+            ctr.exec_observed(OBSERVER_TIMEOUT).await?;
+        }
+        let identity = attempt.wait_observed(OBSERVER_TIMEOUT).await?;
+        info!(sl(), "observed init task kernel exec"; "generation" => identity.generation, "pid" => identity.pid);
+        Ok(())
     }
 
     #[instrument]
@@ -915,12 +1183,96 @@ fn mem_agent_compactconfig_to_compact_optionconfig(
 
 #[async_trait]
 impl agent_ttrpc::AgentService for AgentService {
+    async fn get_preparation_admission_challenge(
+        &self,
+        _ctx: &TtrpcContext,
+        _req: Empty,
+    ) -> ttrpc::Result<protocols::agent::PreparationAdmissionChallenge> {
+        #[cfg(feature = "launch-admission")]
+        {
+            let mut response = protocols::agent::PreparationAdmissionChallenge::new();
+            response.guest_nonce = self.preparation_admission.challenge()?;
+            Ok(response)
+        }
+        #[cfg(not(feature = "launch-admission"))]
+        Err(ttrpc_error(
+            ttrpc::Code::UNIMPLEMENTED,
+            "preparation admission feature unavailable",
+        ))
+    }
+
+    async fn validate_preparation_admission(
+        &self,
+        _ctx: &TtrpcContext,
+        req: protocols::agent::ValidatePreparationAdmissionRequest,
+    ) -> ttrpc::Result<Empty> {
+        // Never trace submitted signed bundles or use host annotations/context
+        // as trust. The service's gate is supplied only by trusted startup.
+        #[cfg(feature = "launch-admission")]
+        {
+            self.preparation_admission.validate(
+                &req.signed_grant_json,
+                &req.signed_policy_aggregate_json,
+                &req.signed_authority_admission_json,
+            )
+        }
+        #[cfg(not(feature = "launch-admission"))]
+        {
+            let _ = req;
+            Err(ttrpc_error(
+                ttrpc::Code::UNIMPLEMENTED,
+                "preparation admission feature unavailable",
+            ))
+        }
+    }
+
     async fn create_container(
         &self,
         ctx: &TtrpcContext,
         req: protocols::agent::CreateContainerRequest,
     ) -> ttrpc::Result<Empty> {
+        #[cfg(feature = "final-task")]
+        if AGENT_CONFIG.exec_proof_required {
+            is_allowed(&req).await?;
+            let runtime = self.final_runtime()?;
+            if !req.devices.is_empty()
+                || !req.storages.is_empty()
+                || !req.shared_mounts.is_empty()
+                || req.sandbox_pidns
+                || req.string_user.is_some()
+                || req.stdin_port != 0
+                || req.stdout_port != 0
+                || req.stderr_port != 0
+                || (!req.exec_id.is_empty() && req.exec_id != req.container_id)
+            {
+                return Err(ttrpc_error(
+                    ttrpc::Code::INVALID_ARGUMENT,
+                    "unsupported final task device/storage/namespace/user/IO transform",
+                ));
+            }
+            let spec: oci_spec::runtime::Spec = req
+                .OCI
+                .into_option()
+                .ok_or_else(|| {
+                    ttrpc_error(ttrpc::Code::INVALID_ARGUMENT, "missing final task spec")
+                })?
+                .into();
+            let process = spec.process().as_ref().ok_or_else(|| {
+                ttrpc_error(ttrpc::Code::INVALID_ARGUMENT, "missing final task process")
+            })?;
+            runtime
+                .create(&req.container_id, &spec, process, self.final_observer()?)
+                .map_ttrpc_err(same)?;
+            return Ok(Empty::new());
+        }
+
+        ensure_workload_launch_available(&AGENT_CONFIG)?;
+        #[cfg(not(feature = "exec-observer"))]
         trace_rpc_call!(ctx, "create_container", req);
+        #[cfg(feature = "exec-observer")]
+        let _ = ctx;
+        #[cfg(feature = "exec-observer")]
+        info!(sl(), "rpc call from shim to agent: create_container");
         is_allowed(&req).await?;
         self.do_create_container(req).await.map_ttrpc_err(same)?;
         Ok(Empty::new())
@@ -931,6 +1283,17 @@ impl agent_ttrpc::AgentService for AgentService {
         ctx: &TtrpcContext,
         req: protocols::agent::StartContainerRequest,
     ) -> ttrpc::Result<Empty> {
+        #[cfg(feature = "final-task")]
+        if AGENT_CONFIG.exec_proof_required {
+            is_allowed(&req).await?;
+            self.final_runtime()?
+                .start(&req.container_id, self.final_observer()?)
+                .await
+                .map_ttrpc_err(same)?;
+            return Ok(Empty::new());
+        }
+
+        ensure_workload_launch_available(&AGENT_CONFIG)?;
         trace_rpc_call!(ctx, "start_container", req);
         is_allowed(&req).await?;
         self.do_start_container(req).await.map_ttrpc_err(same)?;
@@ -942,6 +1305,26 @@ impl agent_ttrpc::AgentService for AgentService {
         ctx: &TtrpcContext,
         req: protocols::agent::RemoveContainerRequest,
     ) -> ttrpc::Result<Empty> {
+        #[cfg(feature = "final-task")]
+        if AGENT_CONFIG.exec_proof_required {
+            is_allowed(&req).await?;
+            let remove = self.final_runtime()?.remove(&req.container_id);
+            if req.timeout == 0 {
+                remove.await.map_ttrpc_err(same)?;
+            } else {
+                tokio::time::timeout(Duration::from_secs(req.timeout.into()), remove)
+                    .await
+                    .map_err(|_| {
+                        ttrpc_error(
+                            ttrpc::Code::DEADLINE_EXCEEDED,
+                            "final task cleanup still pending",
+                        )
+                    })?
+                    .map_ttrpc_err(same)?;
+            }
+            return Ok(Empty::new());
+        }
+
         trace_rpc_call!(ctx, "remove_container", req);
         is_allowed(&req).await?;
         self.do_remove_container(req).await.map_ttrpc_err(same)?;
@@ -953,6 +1336,14 @@ impl agent_ttrpc::AgentService for AgentService {
         ctx: &TtrpcContext,
         req: protocols::agent::ExecProcessRequest,
     ) -> ttrpc::Result<Empty> {
+        ensure_workload_launch_available(&AGENT_CONFIG)?;
+        #[cfg(feature = "exec-observer")]
+        if self.exec_observer.is_some() {
+            return Err(ttrpc_error(
+                ttrpc::Code::UNIMPLEMENTED,
+                "exec observer supports init task only",
+            ));
+        }
         trace_rpc_call!(ctx, "exec_process", req);
         is_allowed(&req).await?;
         self.do_exec_process(req).await.map_ttrpc_err(same)?;
@@ -964,6 +1355,21 @@ impl agent_ttrpc::AgentService for AgentService {
         ctx: &TtrpcContext,
         req: protocols::agent::SignalProcessRequest,
     ) -> ttrpc::Result<Empty> {
+        #[cfg(feature = "final-task")]
+        if AGENT_CONFIG.exec_proof_required {
+            is_allowed(&req).await?;
+            if !req.exec_id.is_empty() && req.exec_id != req.container_id {
+                return Err(ttrpc_error(
+                    ttrpc::Code::INVALID_ARGUMENT,
+                    "final task init ID mismatch",
+                ));
+            }
+            self.final_runtime()?
+                .signal(&req.container_id, req.signal as i32)
+                .map_ttrpc_err(same)?;
+            return Ok(Empty::new());
+        }
+
         trace_rpc_call!(ctx, "signal_process", req);
         is_allowed(&req).await?;
         self.do_signal_process(req).await.map_ttrpc_err(same)?;
@@ -975,6 +1381,26 @@ impl agent_ttrpc::AgentService for AgentService {
         ctx: &TtrpcContext,
         req: protocols::agent::WaitProcessRequest,
     ) -> ttrpc::Result<WaitProcessResponse> {
+        #[cfg(feature = "final-task")]
+        if AGENT_CONFIG.exec_proof_required {
+            is_allowed(&req).await?;
+            if req.exec_id != req.container_id {
+                return Err(ttrpc_error(
+                    ttrpc::Code::INVALID_ARGUMENT,
+                    "final task init ID mismatch",
+                ));
+            }
+            let status = self
+                .final_runtime()?
+                .wait(&req.container_id)
+                .await
+                .map_ttrpc_err(same)?;
+            return Ok(WaitProcessResponse {
+                status,
+                ..Default::default()
+            });
+        }
+
         trace_rpc_call!(ctx, "wait_process", req);
         is_allowed(&req).await?;
         self.do_wait_process(req).await.map_ttrpc_err(same)
@@ -1036,6 +1462,7 @@ impl agent_ttrpc::AgentService for AgentService {
         ctx: &TtrpcContext,
         req: protocols::agent::ResumeContainerRequest,
     ) -> ttrpc::Result<protocols::empty::Empty> {
+        ensure_workload_launch_available(&AGENT_CONFIG)?;
         trace_rpc_call!(ctx, "resume_container", req);
         is_allowed(&req).await?;
 
@@ -1074,6 +1501,30 @@ impl agent_ttrpc::AgentService for AgentService {
         _ctx: &TtrpcContext,
         req: protocols::agent::WriteStreamRequest,
     ) -> ttrpc::Result<WriteStreamResponse> {
+        #[cfg(feature = "final-task")]
+        if AGENT_CONFIG.exec_proof_required {
+            is_allowed(&req).await?;
+            if req.exec_id != req.container_id {
+                return Err(ttrpc_error(
+                    ttrpc::Code::INVALID_ARGUMENT,
+                    "final task init ID mismatch",
+                ));
+            }
+            let runtime = self.final_runtime()?;
+            let length = if req.data.is_empty() {
+                runtime.close_stdin(&req.container_id).map_ttrpc_err(same)?;
+                0
+            } else {
+                runtime
+                    .write_stdin(&req.container_id, &req.data)
+                    .map_ttrpc_err(same)?
+            };
+            return Ok(WriteStreamResponse {
+                len: length as u32,
+                ..Default::default()
+            });
+        }
+
         is_allowed(&req).await?;
         self.do_write_stream(req).await.map_ttrpc_err(same)
     }
@@ -1083,6 +1534,27 @@ impl agent_ttrpc::AgentService for AgentService {
         _ctx: &TtrpcContext,
         req: protocols::agent::ReadStreamRequest,
     ) -> ttrpc::Result<ReadStreamResponse> {
+        #[cfg(feature = "final-task")]
+        if AGENT_CONFIG.exec_proof_required {
+            if req.exec_id != req.container_id {
+                return Err(ttrpc_error(
+                    ttrpc::Code::INVALID_ARGUMENT,
+                    "final task init ID mismatch",
+                ));
+            }
+            let mut data = self
+                .final_runtime()?
+                .read_stdout(&req.container_id, req.len as usize)
+                .map_ttrpc_err(same)?;
+            if is_allowed(&req).await.is_err() {
+                data.clear();
+            }
+            return Ok(ReadStreamResponse {
+                data,
+                ..Default::default()
+            });
+        }
+
         let mut response = self.do_read_stream(&req, true).await.map_ttrpc_err(same)?;
         if is_allowed(&req).await.is_err() {
             // Policy does not allow reading logs, so we redact the log messages.
@@ -1096,6 +1568,27 @@ impl agent_ttrpc::AgentService for AgentService {
         _ctx: &TtrpcContext,
         req: protocols::agent::ReadStreamRequest,
     ) -> ttrpc::Result<ReadStreamResponse> {
+        #[cfg(feature = "final-task")]
+        if AGENT_CONFIG.exec_proof_required {
+            if req.exec_id != req.container_id {
+                return Err(ttrpc_error(
+                    ttrpc::Code::INVALID_ARGUMENT,
+                    "final task init ID mismatch",
+                ));
+            }
+            let mut data = self
+                .final_runtime()?
+                .read_stderr(&req.container_id, req.len as usize)
+                .map_ttrpc_err(same)?;
+            if is_allowed(&req).await.is_err() {
+                data.clear();
+            }
+            return Ok(ReadStreamResponse {
+                data,
+                ..Default::default()
+            });
+        }
+
         let mut response = self.do_read_stream(&req, false).await.map_ttrpc_err(same)?;
         if is_allowed(&req).await.is_err() {
             // Policy does not allow reading logs, so we redact the log messages.
@@ -1109,6 +1602,21 @@ impl agent_ttrpc::AgentService for AgentService {
         ctx: &TtrpcContext,
         req: protocols::agent::CloseStdinRequest,
     ) -> ttrpc::Result<Empty> {
+        #[cfg(feature = "final-task")]
+        if AGENT_CONFIG.exec_proof_required {
+            is_allowed(&req).await?;
+            if req.exec_id != req.container_id {
+                return Err(ttrpc_error(
+                    ttrpc::Code::INVALID_ARGUMENT,
+                    "final task init ID mismatch",
+                ));
+            }
+            self.final_runtime()?
+                .close_stdin(&req.container_id)
+                .map_ttrpc_err(same)?;
+            return Ok(Empty::new());
+        }
+
         // The stdin will be closed when EOF is got in rpc `write_stdin`[runtime-rs]
         // so this rpc will not be called anymore by runtime-rs.
 
@@ -1480,6 +1988,7 @@ impl agent_ttrpc::AgentService for AgentService {
         ctx: &TtrpcContext,
         req: protocols::agent::CreateSandboxRequest,
     ) -> ttrpc::Result<Empty> {
+        ensure_workload_launch_available(&AGENT_CONFIG)?;
         trace_rpc_call!(ctx, "create_sandbox", req);
         is_allowed(&req).await?;
 
@@ -2030,11 +2539,153 @@ pub async fn start(
     server_address: &str,
     init_mode: bool,
     oma: Option<mem_agent::agent::MemAgent>,
+    #[cfg(feature = "exec-observer")] exec_observer: Observer,
+    #[cfg(feature = "exec-observer")] exec_tasks: SharedExecTasks,
+) -> Result<TtrpcServer> {
+    start_impl(
+        s,
+        server_address,
+        init_mode,
+        oma,
+        #[cfg(feature = "exec-observer")]
+        exec_observer,
+        #[cfg(feature = "exec-observer")]
+        exec_tasks,
+        #[cfg(feature = "launch-admission")]
+        crate::launch_admission::AdmissionRuntime::default(),
+        #[cfg(feature = "final-task")]
+        None,
+    )
+    .await
+}
+
+/// Explicit trusted-runtime hook. Ordinary startup installs no guest gate, and
+/// supplying one never changes the proof-required workload launch guard.
+#[cfg(feature = "launch-admission")]
+#[allow(dead_code)] // Embedding hook; no production trust/clock adapter is installed.
+pub async fn start_with_preparation_admission(
+    s: Arc<Mutex<Sandbox>>,
+    server_address: &str,
+    init_mode: bool,
+    oma: Option<mem_agent::agent::MemAgent>,
+    #[cfg(feature = "exec-observer")] exec_observer: Observer,
+    #[cfg(feature = "exec-observer")] exec_tasks: SharedExecTasks,
+    gate: Arc<execution_proof_handoff::admission::GuestAdmissionGate>,
+) -> Result<TtrpcServer> {
+    start_impl(
+        s,
+        server_address,
+        init_mode,
+        oma,
+        #[cfg(feature = "exec-observer")]
+        exec_observer,
+        #[cfg(feature = "exec-observer")]
+        exec_tasks,
+        crate::launch_admission::AdmissionRuntime::with_gate(gate),
+        #[cfg(feature = "final-task")]
+        None,
+    )
+    .await
+}
+
+/// Trusted embedding hook. Host requests never install runtime state or leases.
+#[cfg(feature = "final-task")]
+#[allow(dead_code)]
+pub async fn start_with_final_tasks(
+    s: Arc<Mutex<Sandbox>>,
+    server_address: &str,
+    init_mode: bool,
+    oma: Option<mem_agent::agent::MemAgent>,
+    exec_observer: Observer,
+    exec_tasks: SharedExecTasks,
+    runtime: crate::final_task_runtime::FinalTaskRuntime,
+) -> Result<TtrpcServer> {
+    start_impl(
+        s,
+        server_address,
+        init_mode,
+        oma,
+        exec_observer,
+        exec_tasks,
+        crate::launch_admission::AdmissionRuntime::default(),
+        Some(runtime),
+    )
+    .await
+}
+
+/// Trusted embedding hook for admission and final tasks in the same service.
+/// The caller retains responsibility for trusted provisioning, staging custody
+/// leases into this runtime, and keeping its protected-export owner alive.
+/// Host requests cannot install either the gate or the runtime.
+#[cfg(feature = "final-task")]
+#[allow(dead_code)]
+pub async fn start_with_preparation_and_final_tasks(
+    s: Arc<Mutex<Sandbox>>,
+    server_address: &str,
+    init_mode: bool,
+    oma: Option<mem_agent::agent::MemAgent>,
+    exec_observer: Observer,
+    exec_tasks: SharedExecTasks,
+    gate: Arc<execution_proof_handoff::admission::GuestAdmissionGate>,
+    runtime: crate::final_task_runtime::FinalTaskRuntime,
+) -> Result<TtrpcServer> {
+    start_impl(
+        s,
+        server_address,
+        init_mode,
+        oma,
+        exec_observer,
+        exec_tasks,
+        crate::launch_admission::AdmissionRuntime::with_gate(gate),
+        Some(runtime),
+    )
+    .await
+}
+
+/// Closed host-management surface for the explicit GCP proof profile. Trusted
+/// startup owns the runtime, custody channels, configuration and exporter owner;
+/// host RPCs cannot install them. Unlisted and future methods are unregistered.
+#[cfg(feature = "gcp-proof-startup")]
+#[allow(dead_code)]
+pub async fn start_gcp_proof(
+    server_address: &str,
+    exec_observer: Observer,
+    runtime: crate::final_task_runtime::FinalTaskRuntime,
+) -> Result<TtrpcServer> {
+    anyhow::ensure!(
+        AGENT_CONFIG.exec_proof_required,
+        "GCP proof service requires the proof-only task path"
+    );
+    gcp_rpc::start_gcp_proof(server_address, exec_observer, runtime)
+}
+
+#[cfg(feature = "gcp-proof-startup")]
+#[path = "gcp_rpc.rs"]
+mod gcp_rpc;
+
+async fn start_impl(
+    s: Arc<Mutex<Sandbox>>,
+    server_address: &str,
+    init_mode: bool,
+    oma: Option<mem_agent::agent::MemAgent>,
+    #[cfg(feature = "exec-observer")] exec_observer: Observer,
+    #[cfg(feature = "exec-observer")] exec_tasks: SharedExecTasks,
+    #[cfg(feature = "launch-admission")]
+    preparation_admission: crate::launch_admission::AdmissionRuntime,
+    #[cfg(feature = "final-task")] final_tasks: Option<crate::final_task_runtime::FinalTaskRuntime>,
 ) -> Result<TtrpcServer> {
     let agent_service = Box::new(AgentService {
         sandbox: s,
         init_mode,
         oma,
+        #[cfg(feature = "final-task")]
+        final_tasks,
+        #[cfg(feature = "launch-admission")]
+        preparation_admission,
+        #[cfg(feature = "exec-observer")]
+        exec_observer: Some(exec_observer),
+        #[cfg(feature = "exec-observer")]
+        exec_tasks,
     });
     let aservice = agent_ttrpc::create_agent_service(Arc::new(*agent_service));
 
@@ -2722,6 +3373,26 @@ mod tests {
 
     const CGROUP_PARENT: &str = "kata.agent.test.k8s.io";
 
+    #[test]
+    fn test_exec_proof_required_launch_guard() {
+        let mut config = crate::config::AgentConfig::default();
+        assert!(ensure_workload_launch_available(&config).is_ok());
+        config.exec_proof_required = true;
+        let error = ensure_workload_launch_available(&config).unwrap_err();
+        match error {
+            ttrpc::Error::RpcStatus(status) => {
+                assert_eq!(status.code(), ttrpc::Code::UNIMPLEMENTED);
+                assert!(status
+                    .message()
+                    .contains("authenticated launch adapters are unavailable"));
+            }
+            other => panic!(
+                "expected an explicit unsupported proof path, got {:?}",
+                other
+            ),
+        }
+    }
+
     fn check_command(cmd: &str) -> bool {
         which(cmd).is_ok()
     }
@@ -2860,6 +3531,23 @@ mod tests {
         assert_eq!(s.hooks, oci.hooks().clone());
     }
 
+    #[cfg(feature = "final-task")]
+    #[tokio::test]
+    async fn final_task_factory_is_absent_without_trusted_injection() {
+        let logger = slog::Logger::root(slog::Discard, o!());
+        let service = AgentService {
+            sandbox: Arc::new(Mutex::new(Sandbox::new(&logger).unwrap())),
+            init_mode: true,
+            final_tasks: None,
+            oma: None,
+            preparation_admission: crate::launch_admission::AdmissionRuntime::default(),
+            exec_observer: None,
+            exec_tasks: Arc::new(std::sync::Mutex::new(ExecTasks::default())),
+        };
+        assert!(service.final_runtime().is_err());
+        assert!(service.final_observer().is_err());
+    }
+
     #[tokio::test]
     async fn test_update_interface() {
         let logger = slog::Logger::root(slog::Discard, o!());
@@ -2868,7 +3556,15 @@ mod tests {
         let agent_service = Box::new(AgentService {
             sandbox: Arc::new(Mutex::new(sandbox)),
             init_mode: true,
+            #[cfg(feature = "final-task")]
+            final_tasks: None,
             oma: None,
+            #[cfg(feature = "launch-admission")]
+            preparation_admission: crate::launch_admission::AdmissionRuntime::default(),
+            #[cfg(feature = "exec-observer")]
+            exec_observer: None,
+            #[cfg(feature = "exec-observer")]
+            exec_tasks: Arc::new(std::sync::Mutex::new(ExecTasks::default())),
         });
 
         let req = protocols::agent::UpdateInterfaceRequest::default();
@@ -2886,7 +3582,15 @@ mod tests {
         let agent_service = Box::new(AgentService {
             sandbox: Arc::new(Mutex::new(sandbox)),
             init_mode: true,
+            #[cfg(feature = "final-task")]
+            final_tasks: None,
             oma: None,
+            #[cfg(feature = "launch-admission")]
+            preparation_admission: crate::launch_admission::AdmissionRuntime::default(),
+            #[cfg(feature = "exec-observer")]
+            exec_observer: None,
+            #[cfg(feature = "exec-observer")]
+            exec_tasks: Arc::new(std::sync::Mutex::new(ExecTasks::default())),
         });
 
         let req = protocols::agent::UpdateRoutesRequest::default();
@@ -2904,7 +3608,15 @@ mod tests {
         let agent_service = Box::new(AgentService {
             sandbox: Arc::new(Mutex::new(sandbox)),
             init_mode: true,
+            #[cfg(feature = "final-task")]
+            final_tasks: None,
             oma: None,
+            #[cfg(feature = "launch-admission")]
+            preparation_admission: crate::launch_admission::AdmissionRuntime::default(),
+            #[cfg(feature = "exec-observer")]
+            exec_observer: None,
+            #[cfg(feature = "exec-observer")]
+            exec_tasks: Arc::new(std::sync::Mutex::new(ExecTasks::default())),
         });
 
         let req = protocols::agent::AddARPNeighborsRequest::default();
@@ -3042,7 +3754,15 @@ mod tests {
             let agent_service = Box::new(AgentService {
                 sandbox: Arc::new(Mutex::new(sandbox)),
                 init_mode: true,
+                #[cfg(feature = "final-task")]
+                final_tasks: None,
                 oma: None,
+                #[cfg(feature = "launch-admission")]
+                preparation_admission: crate::launch_admission::AdmissionRuntime::default(),
+                #[cfg(feature = "exec-observer")]
+                exec_observer: None,
+                #[cfg(feature = "exec-observer")]
+                exec_tasks: Arc::new(std::sync::Mutex::new(ExecTasks::default())),
             });
 
             let result = agent_service
@@ -3530,7 +4250,15 @@ OtherField:other
         let agent_service = Box::new(AgentService {
             sandbox: Arc::new(Mutex::new(sandbox)),
             init_mode: true,
+            #[cfg(feature = "final-task")]
+            final_tasks: None,
             oma: None,
+            #[cfg(feature = "launch-admission")]
+            preparation_admission: crate::launch_admission::AdmissionRuntime::default(),
+            #[cfg(feature = "exec-observer")]
+            exec_observer: None,
+            #[cfg(feature = "exec-observer")]
+            exec_tasks: Arc::new(std::sync::Mutex::new(ExecTasks::default())),
         });
 
         let ctx = mk_ttrpc_context();
@@ -3739,7 +4467,15 @@ COMMIT
         let agent_service = Arc::new(AgentService {
             sandbox: Arc::new(Mutex::new(sandbox)),
             init_mode: true,
+            #[cfg(feature = "final-task")]
+            final_tasks: None,
             oma: None,
+            #[cfg(feature = "launch-admission")]
+            preparation_admission: crate::launch_admission::AdmissionRuntime::default(),
+            #[cfg(feature = "exec-observer")]
+            exec_observer: None,
+            #[cfg(feature = "exec-observer")]
+            exec_tasks: Arc::new(std::sync::Mutex::new(ExecTasks::default())),
         });
 
         let svc1 = agent_service.clone();
@@ -4162,5 +4898,45 @@ COMMIT
             }
             (tc.assertions)(&base).context(tc.name).unwrap()
         }
+    }
+    #[cfg(feature = "exec-observer")]
+    #[test]
+    fn test_exec_task_reaped_before_registration_is_rejected() {
+        let mut tasks = ExecTasks::default();
+        assert!(tasks.terminal(123).is_none());
+        assert!(tasks.register("new-container", 123).is_err());
+        assert!(tasks.register("new-container", 124).is_ok());
+    }
+
+    #[cfg(feature = "exec-observer")]
+    #[test]
+    fn test_exec_task_retains_notification_slot_and_rejects_pid_reuse() {
+        let mut tasks = ExecTasks::default();
+        let first = tasks.register("container", 123).unwrap();
+        assert_eq!(tasks.terminal(123), Some(first.clone()));
+        assert!(!tasks.tasks["container"].live);
+        assert!(tasks.register("container", 124).is_err());
+        let mut wrong_generation = first.clone();
+        wrong_generation.generation += 1;
+        tasks.finish(&wrong_generation);
+        assert!(tasks.tasks.contains_key("container"));
+        tasks.finish(&first);
+        let second = tasks.register("container", 124).unwrap();
+        assert!(second.generation > first.generation);
+        assert!(tasks.register("other-container", 123).is_err());
+    }
+
+    #[cfg(feature = "exec-observer")]
+    #[test]
+    fn test_exec_task_pid_history_overflow_stays_fail_closed() {
+        let mut tasks = ExecTasks::default();
+        for pid in 1..=4097 {
+            tasks.terminal(pid);
+        }
+        assert!(tasks.exhausted);
+        assert!(tasks.register("new-container", 5000).is_err());
+        tasks.terminal(1);
+        assert!(tasks.register("new-container", 5001).is_err());
+        assert_eq!(tasks.retired.len(), 4096);
     }
 }

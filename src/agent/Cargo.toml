@@ -82,6 +82,10 @@ safe-path.workspace = true
 logging.workspace = true
 vsock-exporter.workspace = true
 pathrs.workspace = true
+execution-proof-handoff = { path = "../../../execution-proof-prototype/handoff", optional = true }
+execution-proof-contract = { path = "../../../execution-proof-prototype/contract", optional = true }
+attester = { path = "../../../guest-components-prepared-dev/attestation-agent/attester", default-features = false, features = ["execution-quote-tdx"], optional = true }
+image-rs = { package = "image-rs-preparation", path = "../../../guest-components-prepared-dev/image-rs/preparation-core", default-features = false, features = ["launch-preparation-receive"], optional = true }
 
 # Initdata
 base64 = { workspace = true }
@@ -104,7 +108,47 @@ test-utils.workspace = true
 lto = true
 
 [features]
+launch-admission = ["dep:execution-proof-handoff"]
+rootfs-custody = ["launch-admission", "execution-proof-handoff/rootfs-custody", "dep:image-rs"]
+exec-observer = ["rustjail/exec-observer"]
+final-task = ["rootfs-custody", "exec-observer", "rustjail/final-task", "image-rs/launch-preparation-execution"]
+final-task-native = ["final-task", "dep:execution-proof-contract"]
+protected-export = ["final-task"]
+protected-export-tdx = ["protected-export", "dep:attester"]
+protected-export-gcp-native = ["final-task-native", "protected-export-gcp-tdx"]
+protected-export-gcp-tdx = ["protected-export", "dep:execution-proof-contract", "dep:attester"]
+gcp-proof-startup = ["protected-export-gcp-tdx", "execution-proof-handoff/gcp-startup"]
+gcp-task-controller = ["dep:execution-proof-contract", "dep:image-rs"]
+protected-export-native = ["final-task-native", "protected-export-tdx"]
 seccomp = ["rustjail/seccomp"]
 agent-policy = ["kata-agent-policy"]
 init-data = []
 devicemapper = ["kata-types/devicemapper"]
+
+[[bin]]
+name = "kata-final-task-native"
+path = "src/bin/final_task_native.rs"
+test = false
+required-features = ["final-task-native"]
+
+[[bin]]
+name = "kata-protected-export-native"
+path = "src/bin/final_task_native.rs"
+test = false
+required-features = ["protected-export-native"]
+
+[[bin]]
+name = "kata-protected-export-gcp-native"
+path = "src/bin/final_task_native.rs"
+test = false
+required-features = ["protected-export-gcp-native"]
+
+[[bin]]
+name = "kata-agent-gcp-proof"
+path = "src/bin/gcp_proof.rs"
+required-features = ["gcp-proof-startup"]
+
+[[bin]]
+name = "kata-gcp-task-controller"
+path = "src/bin/gcp_task_controller.rs"
+required-features = ["gcp-task-controller"]
